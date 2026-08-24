@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import string
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from uuid import UUID
 
+from outbound_ai.common.arabic import normalize_arabic
 from outbound_ai.config.settings import Settings, get_settings
 from outbound_ai.db.connection import TenantContext, get_database
 from outbound_ai.db.repositories.agent import (
@@ -16,7 +19,7 @@ from outbound_ai.db.repositories.agent import (
 )
 from outbound_ai.db.repositories.knowledge import KnowledgeMatch, hybrid_match_chunks
 from outbound_ai.observability.logging import log_event
-from outbound_ai.rag.embeddings import DeterministicEmbeddings, OpenAIEmbeddings, vector_literal
+from outbound_ai.rag.embeddings import EmbeddingPort, build_embeddings, vector_literal
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +51,8 @@ class AgentAnswer:
     used_llm: bool
 
 
-def _embedding_provider(settings: Settings):
-    if settings.rag_embedding_provider == "deterministic":
-        return DeterministicEmbeddings(settings.openai_embedding_dim)
-    return OpenAIEmbeddings(settings)
+def _embedding_provider(settings: Settings) -> EmbeddingPort:
+    return build_embeddings(settings)
 
 
 def _citation_rows(matches: list[KnowledgeMatch]) -> list[Citation]:
@@ -68,6 +69,95 @@ def _citation_rows(matches: list[KnowledgeMatch]) -> list[Citation]:
         )
         for index, match in enumerate(matches, start=1)
     ]
+
+
+_COMMON_QUERY_WORDS = {
+    "من", "ما", "ماذا", "هل", "هو", "هي", "في", "عن", "على", "الى", "إلى",
+    "هذا", "هذه", "ذلك", "تلك", "تم", "كان", "يكون", "الذي", "التي", "و", "or",
+    "the", "what", "who", "where", "when", "how",
+}
+_TOKEN_TRIM = string.punctuation + "،؛؟"
+
+
+def _content_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for raw_token in normalize_arabic(text).lower().split():
+        token = raw_token.strip(_TOKEN_TRIM)
+        if len(token) >= 3 and token not in _COMMON_QUERY_WORDS:
+            terms.add(token)
+    return terms
+
+
+def _has_query_support(query_terms: set[str], content_terms: set[str]) -> bool:
+    """Support exact, Arabic-normalized, and small-typo matches."""
+
+    if not query_terms or not content_terms:
+        return False
+    if query_terms & content_terms:
+        return True
+    return any(
+        SequenceMatcher(None, query_term, content_term).ratio() >= 0.82
+        for query_term in query_terms
+        for content_term in content_terms
+    )
+
+
+def _select_relevant_matches(
+    matches: list[KnowledgeMatch],
+    settings: Settings,
+    query_text: str,
+) -> list[KnowledgeMatch]:
+    """Keep strong and query-supported evidence, not arbitrary top-k rows.
+
+    The hybrid score ranks candidates but is not a calibrated probability. A
+    fixed floor, a score-gap rule, and a lightweight lexical-support check are
+    combined so a genuinely multi-source answer can retain several documents,
+    while an unrelated tail result is excluded even when the database returns
+    it in the requested top-k window.
+    """
+
+    if not matches:
+        return []
+    ranked = sorted(matches, key=lambda item: item.similarity, reverse=True)
+    top_score = ranked[0].similarity
+    floor = max(
+        settings.rag_min_citation_score,
+        top_score * settings.rag_citation_relative_threshold,
+    )
+    max_unmatched_gap = max(0.12, top_score * 0.25)
+    lexical_min_score = max(0.15, settings.rag_min_citation_score * 0.5)
+    query_terms = _content_terms(query_text)
+    # Greetings, very short inputs, and punctuation-only inputs have no
+    # document-search intent. Never turn arbitrary top-k rows into sources.
+    if not query_terms:
+        return []
+    support_by_match = {
+        id(match): _has_query_support(query_terms, _content_terms(match.content_raw))
+        for match in ranked
+    }
+    if not any(
+        support_by_match[id(match)] and match.similarity >= lexical_min_score
+        for match in ranked
+    ) and top_score < settings.rag_min_grounding_score:
+        return []
+    selected: list[KnowledgeMatch] = []
+    for index, match in enumerate(ranked):
+        lexical_support = support_by_match[id(match)]
+        # Explicit normalized/typo-tolerant lexical evidence can qualify a
+        # result even when its semantic score falls below the relative floor.
+        if lexical_support and match.similarity >= lexical_min_score:
+            selected.append(match)
+            continue
+        if match.similarity < floor:
+            continue
+        if index == 0:
+            selected.append(match)
+            continue
+        score_gap = top_score - match.similarity
+        if score_gap > max_unmatched_gap:
+            continue
+        selected.append(match)
+    return selected[: settings.rag_max_citations]
 
 
 def _offline_answer(citations: list[Citation]) -> str:
@@ -107,7 +197,8 @@ def _llm_answer(settings: Settings, question: str, citations: list[Citation]) ->
     prompt = (
         "أنت مساعد لموظف خدمة عملاء. أجب بالعربية الواضحة وباختصار. "
         "استخدم الأدلة فقط، ولا تخترع سياسة أو معلومة. إذا لم تكف الأدلة فقل ذلك بوضوح. "
-        "ضع أرقام المصادر مثل [S1] بعد الجمل التي تعتمد عليها.\n\n"
+        "إذا كان السؤال مختصراً أو حذف اسم الدولة أو الجهة، أكمل الإجابة بسياقها الكامل كما يظهر في الدليل؛ "
+        "لا تكتفِ بإجابة مبتورة مثل اسم شخص فقط. ضع أرقام المصادر مثل [S1] بعد الجمل التي تعتمد عليها.\n\n"
         f"السؤال: {question}\n\nالأدلة:\n{evidence}"
     )
     client_kwargs = {"api_key": api_key}
@@ -148,7 +239,11 @@ def answer_question(
         raise ValueError("question cannot be empty")
     settings = settings or get_settings()
     embeddings = embeddings or _embedding_provider(settings)
-    query_vector = embeddings.embed([question])[0]
+    normalized_question = normalize_arabic(question)
+    embedding_query = question
+    if normalized_question and normalized_question != question:
+        embedding_query = f"{question}\n{normalized_question}"
+    query_vector = embeddings.embed([embedding_query])[0]
     database = get_database()
 
     with database.transaction(context) as connection:
@@ -170,19 +265,18 @@ def answer_question(
         matches = hybrid_match_chunks(
             connection,
             context=context,
-            query_text=question,
+            query_text=normalized_question or question,
             query_embedding=vector_literal(query_vector),
-            match_count=settings.rag_top_n_after_rerank,
+            # Retrieve a wider candidate set, then filter the tail before the
+            # LLM sees it. This improves recall without presenting weak sources.
+            match_count=max(settings.rag_top_n_after_rerank * 4, settings.rag_max_citations),
         )
-        citations = _citation_rows(matches)
+        selected_matches = _select_relevant_matches(matches, settings, question)
+        citations = _citation_rows(selected_matches)
         grounded = bool(citations) and citations[0].similarity >= settings.rag_min_grounding_score
-        if not grounded:
-            citations = citations[:3]
-        # Deterministic embeddings can produce a lower numeric similarity even
-        # when lexical/hybrid retrieval found useful evidence. If citations exist
-        # and a provider is configured, let the provider answer strictly from
-        # those citations; reserve the offline template for no evidence or an
-        # explicitly offline configuration.
+        # The hybrid score is a ranking indicator, not a calibrated probability.
+        # The selected citations are the only evidence passed to the LLM; the
+        # offline template is reserved for no evidence or explicit offline mode.
         answer = (
             _llm_answer(settings, question, citations)
             if citations and _llm_enabled(settings)

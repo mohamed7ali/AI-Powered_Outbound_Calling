@@ -147,6 +147,21 @@ def update_call_outcome(connection: Connection, *, call_id: UUID, outcome: str) 
     )
 
 
+def mark_case_resolved_from_call(connection: Connection, *, call_id: UUID, resolved_at: datetime) -> None:
+    """Mark the linked support case resolved after a confirmed resolved call."""
+    connection.execute(
+        """
+        update public.support_cases as sc
+        set status = 'RESOLVED'::public.case_status,
+            resolved_at = coalesce(sc.resolved_at, %s),
+            updated_at = %s
+        from public.calls as c
+        where c.id = %s and sc.id = c.case_id
+        """,
+        (resolved_at, resolved_at, call_id),
+    )
+
+
 def next_turn_number(connection: Connection, *, call_id: UUID) -> int:
     row = connection.execute(
         "select coalesce(max(turn_number) + 1, 0) as next_turn from public.call_turns where call_id = %s",
@@ -219,15 +234,33 @@ def record_gather_turn(
     text_raw: str,
     text_norm: str | None,
     turn_number: int,
+    stt_model: str = "vonage-asr",
+    language: str = "ar",
+    audio_path: str | None = None,
 ) -> None:
     connection.execute(
         """
         insert into public.call_turns
-          (organization_id, call_id, turn_number, speaker, text_raw, text_norm, stt_model)
-        values (%s, %s, %s, 'CUSTOMER', %s, %s, 'vonage-asr')
+          (organization_id, call_id, turn_number, speaker, text_raw, text_norm,
+           language, stt_model, audio_path, audio_retained)
+        values (%s, %s, %s, 'CUSTOMER', %s, %s, %s, %s, %s, %s)
         on conflict (call_id, turn_number) do update set
           text_raw = excluded.text_raw,
-          text_norm = excluded.text_norm
+          text_norm = excluded.text_norm,
+          language = excluded.language,
+          stt_model = excluded.stt_model,
+          audio_path = excluded.audio_path,
+          audio_retained = excluded.audio_retained
         """,
-        (organization_id, call_id, turn_number, text_raw, text_norm),
+        (
+            organization_id,
+            call_id,
+            turn_number,
+            text_raw,
+            text_norm,
+            language,
+            stt_model,
+            audio_path,
+            bool(audio_path),
+        ),
     )

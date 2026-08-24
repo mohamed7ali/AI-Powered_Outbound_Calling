@@ -18,6 +18,8 @@ MIGRATION = "\n".join(
         (ROOT / "supabase/migrations/202608200008_allow_authenticated_audit_event_writes.sql").read_text(encoding="utf-8"),
         (ROOT / "supabase/migrations/202608200009_allow_member_escalation_reads.sql").read_text(encoding="utf-8"),
         (ROOT / "supabase/migrations/202608200010_allow_member_followup_task_creation.sql").read_text(encoding="utf-8"),
+        (ROOT / "supabase/migrations/202608230011_switch_to_arabic_sentence_transformer_384.sql").read_text(encoding="utf-8"),
+        (ROOT / "supabase/migrations/202608230012_calibrate_hybrid_retrieval_scores.sql").read_text(encoding="utf-8"),
     )
 )
 
@@ -74,11 +76,15 @@ def test_tenant_security_contract_is_present() -> None:
 
 
 def test_rag_contract_is_permission_aware_and_dimension_matches_settings() -> None:
-    assert "embedding extensions.vector(3072)" in MIGRATION
+    assert "embedding extensions.vector(3072)" in MIGRATION  # initial schema history
+    assert "alter column embedding type extensions.vector(384)" in MIGRATION
+    assert "create index chunks_embedding_idx" in MIGRATION
     assert "create or replace function public.match_knowledge_chunks" in MIGRATION
     assert "security invoker" in MIGRATION
     assert "kc.organization_id = match_organization_id" in MIGRATION
     assert "private.is_org_member(kc.organization_id)" in MIGRATION
+    assert "query_embedding extensions.vector(384)" in MIGRATION
+    assert "greatest(0.0, least(1.0" in MIGRATION
 
 
 def test_runtime_member_workflow_policies_are_present() -> None:

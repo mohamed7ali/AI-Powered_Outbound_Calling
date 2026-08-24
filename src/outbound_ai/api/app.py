@@ -11,6 +11,15 @@ from outbound_ai.api.routers.campaign import router as campaign_router
 from outbound_ai.api.routers.documents import router as documents_router
 from outbound_ai.api.routers.reports import router as reports_router
 from outbound_ai.api.routers.vonage import router as vonage_router
+from outbound_ai.config.settings import get_settings
+from outbound_ai.telephony.local_voice import prewarm_local_voice
+from outbound_ai.telephony.prompts import (
+    GREETING_TEXT,
+    HANDOFF_TEXT,
+    PROCESSING_TEXT,
+    RESOLVED_TEXT,
+    UNRESOLVED_TEXT,
+)
 
 
 def create_app() -> FastAPI:
@@ -22,6 +31,18 @@ def create_app() -> FastAPI:
     app.include_router(campaign_router, prefix="/campaign", tags=["campaign"])
     app.include_router(documents_router, prefix="/documents", tags=["documents"])
     app.include_router(reports_router, prefix="/reports", tags=["reports"])
+
+    @app.on_event("startup")
+    def prewarm_voice_models() -> None:
+        settings = get_settings()
+        if settings.local_stt_enabled or settings.local_tts_enabled:
+            prewarm_local_voice([
+                GREETING_TEXT,
+                PROCESSING_TEXT,
+                HANDOFF_TEXT,
+                RESOLVED_TEXT,
+                UNRESOLVED_TEXT,
+            ])
 
     @app.get("/health")
     def health() -> dict[str, str]:

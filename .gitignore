@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+.secrets/
+*.key
+*.pem
 
 # Python
 __pycache__/
@@ -29,6 +32,15 @@ audio_cache/
 logs/
 *.log
 data/exports/
+
+# Temporary root-level replacement snapshots from earlier debugging
+/app_*.py
+/*_fix.py
+/documents_org_admin_verified.py
+/reports_org_admin_verified.py
+/org_admin_hardening.zip
+/llm_tabs_audit_fix.zip
+/runtime_llm_call_escalation_fix.zip
 
 # Tool scratch
 .claude-flow/

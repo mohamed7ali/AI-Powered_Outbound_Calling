@@ -27,6 +27,11 @@ class ManualCallRequest(BaseModel):
     greeting: str = "مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت."
 
 
+class DirectCallRequest(BaseModel):
+    case_id: UUID
+    greeting: str = "مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت."
+
+
 class SimulatedOutcomeRequest(BaseModel):
     outcome: str = Field(pattern="^(ANSWERED_RESOLVED|ESCALATED|NO_ANSWER|BUSY|FAILED)$")
 
@@ -68,6 +73,7 @@ def list_cases(
             from public.support_cases c
             join public.customers cu on cu.id = c.customer_id
             where c.organization_id = %s
+              and c.status in ('OPEN'::public.case_status, 'IN_PROGRESS'::public.case_status)
             order by c.updated_at desc limit 500
             """,
             (context.organization_id,),
@@ -97,6 +103,72 @@ def create_followup(
         if row is None:
             raise HTTPException(status_code=404, detail="Case not found in this organization")
     return dict(row)
+
+
+@router.get("/followups")
+def list_followups(
+    principal: Principal = Depends(require_principal),
+    organization_id: UUID | None = Header(default=None, alias="X-Organization-Id"),
+) -> list[dict]:
+    """List scheduled follow-up tasks visible in the selected organization."""
+
+    context = _context(principal, organization_id)
+    with get_database().transaction(context) as connection:
+        rows = connection.execute(
+            """
+            select f.id, f.case_id, f.scheduled_for, f.status, f.attempt_number,
+                   f.created_at, f.completed_at,
+                   c.subject, cu.full_name as customer_name, cu.phone_e164
+            from public.follow_up_tasks f
+            join public.support_cases c on c.id = f.case_id
+            join public.customers cu on cu.id = c.customer_id
+            where f.organization_id = %s
+            order by f.scheduled_for desc
+            limit 200
+            """,
+            (context.organization_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@router.post("/calls/direct")
+def start_direct_call(
+    request: DirectCallRequest,
+    principal: Principal = Depends(require_principal),
+    organization_id: UUID | None = Header(default=None, alias="X-Organization-Id"),
+) -> dict:
+    """Start an immediate customer call without creating a scheduled task."""
+    context = _context(principal, organization_id)
+    with get_database().transaction(context) as connection:
+        row = connection.execute(
+            """
+            select c.id as case_id, c.subject, cu.phone_e164
+            from public.support_cases c
+            join public.customers cu on cu.id = c.customer_id
+            where c.id = %s and c.organization_id = %s
+              and c.status in ('OPEN'::public.case_status, 'IN_PROGRESS'::public.case_status)
+            """,
+            (request.case_id, context.organization_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Case not found in this organization")
+    try:
+        call_id, result = start_follow_up_call(
+            context=context,
+            case_id=row["case_id"],
+            to_phone_e164=row["phone_e164"],
+            greeting=request.greeting.strip() or "مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت.",
+            follow_up_task_id=None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Outbound call could not be created") from exc
+    return {
+        "call_id": str(call_id),
+        "case_id": str(row["case_id"]),
+        "provider_call_id": result.provider_call_id,
+        "status": result.status,
+        "follow_up_task_id": None,
+    }
 
 
 @router.post("/calls/{call_id}/simulate-outcome")
@@ -155,6 +227,7 @@ def start_followup(
             join public.support_cases c on c.id = f.case_id
             join public.customers cu on cu.id = c.customer_id
             where f.id = %s and f.organization_id = %s
+              and c.status in ('OPEN'::public.case_status, 'IN_PROGRESS'::public.case_status)
             """,
             (task_id, context.organization_id),
         ).fetchone()

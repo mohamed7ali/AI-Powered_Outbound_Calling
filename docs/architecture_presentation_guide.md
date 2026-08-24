@@ -486,7 +486,7 @@ The strongest closing statement is:
 
 ## 11. Important honesty points
 
-The current live phone path uses Vonage-native TTS and ASR. It does not run a local Whisper model in real time. The current RAG production option is OpenAI embeddings when configured; deterministic embeddings are only for tests and produce poor semantic scores. A local Sentence Transformer is possible, but changing from the current 3072-dimensional vector schema requires a migration and complete re-ingestion.
+The current live phone path uses Vonage-native TTS and ASR. It does not run a local Whisper model in real time. The active RAG provider is a local Arabic Sentence Transformer that returns 384-dimensional vectors; OpenAI-compatible embeddings remain optional, and deterministic embeddings are only an explicit offline/test fallback. Migration 0011 changes the database vector contract and requires complete re-ingestion of existing documents.
 
 The project stores text transcripts, provider events, outcomes, durations, and escalations. It does not currently store raw phone audio. Adding local Whisper requires either Vonage recording callbacks for post-call transcription or a Vonage media-stream/WebSocket architecture for real-time transcription.
 

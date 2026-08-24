@@ -17,14 +17,14 @@ Live Vonage calls currently use Vonage NCCO `talk` for provider-side TTS and `in
 
 | Option | Dimensions/endpoint | Cost/operational trade-off | Recommendation |
 |---|---:|---|---|
-| OpenAI `text-embedding-3-large` | 3072 in this repository | API quota required; current Supabase schema already matches it. | Preferred production path when quota is available. Re-ingest all documents after any provider change. |
-| Local `Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet` | 384-dimensional Sentence Transformer | Free after download; approximately 0.1B parameters and 128-token maximum sequence length according to its model card. Requires changing the database vector dimension and re-ingesting. | Strong low-cost Arabic experiment; do not switch without a migration and full re-index. |
+| Local `Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet` | 384-dimensional Sentence Transformer | Free after download; approximately 0.1B parameters and 128-token maximum sequence length according to its model card. The model is downloaded on first use. | **Active default provider.** Apply migration 0011 and re-index all documents before querying. |
+| OpenAI `text-embedding-3-large` | Configured dimension must be 384 for the current schema | API quota required; the current database contract is now 384 dimensions. | Optional API alternative. Set `RAG_EMBEDDING_PROVIDER=openai`, set `OPENAI_EMBEDDING_DIM=384`, and re-ingest if changing models. |
 | Local multilingual MiniLM baseline | 384 dimensions | Small and free locally, but Arabic quality may be below an Arabic-specialized model. | Useful fallback benchmark. |
 | DeepSeek API | DeepSeek’s official API documentation describes chat/completion models and an OpenAI-compatible interface; it does not document a public embeddings endpoint. | Do not plan on DeepSeek for embeddings unless the provider publishes a supported embedding endpoint. | Use DeepSeek, if desired, as an LLM provider, not as the current embedding provider. |
 
 ## Dimension migration rule
 
-The current database uses a `3072`-dimension vector column and a halfvec HNSW index. A 384-dimensional local model cannot be inserted into that column. A provider switch therefore requires a migration or a new vector column/index, a settings change, and complete document re-ingestion. Mixing dimensions within one index is not valid.
+The current database uses a `384`-dimension vector column and a halfvec HNSW index after migration 0011. The migration clears old embeddings because vectors from different models or dimensions must not be mixed. Any future provider or dimension switch requires a migration, settings change, and complete document re-ingestion.
 
 ## Sources
 

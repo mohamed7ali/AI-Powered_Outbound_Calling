@@ -16,7 +16,7 @@ Supabase now offers publishable and secret API keys in addition to the legacy `a
 
 ## Minimal first-test `.env`
 
-For the first Codespaces test, use simulated telephony and deterministic embeddings:
+For the first Codespaces test, use simulated telephony and the local Arabic Sentence Transformer:
 
 ```dotenv
 SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
@@ -27,14 +27,20 @@ SUPABASE_JWT_SECRET=
 SUPABASE_JWT_AUDIENCE=authenticated
 DOCUMENT_STORAGE_BUCKET=organization-documents
 TELEPHONY_PROVIDER=simulated
-RAG_EMBEDDING_PROVIDER=deterministic
+RAG_EMBEDDING_PROVIDER=sentence_transformers
+RAG_EMBEDDING_DIM=384
+SENTENCE_TRANSFORMER_MODEL=Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet
+SENTENCE_TRANSFORMER_DEVICE=cpu
+RAG_MIN_CITATION_SCORE=0.30
+RAG_CITATION_RELATIVE_THRESHOLD=0.55
+RAG_MAX_CITATIONS=3
 API_HOST=0.0.0.0
 API_PORT=8000
 GRADIO_PORT=7860
 API_BASE_URL=http://localhost:8000
 ```
 
-Leave Vonage and `PUBLIC_WEBHOOK_BASE_URL` blank until the Supabase, RAG, simulated-call, and tenant-isolation tests pass. Configure the Vonage variables only for the later live-call acceptance test.
+After applying migration `202608230011_switch_to_arabic_sentence_transformer_384.sql`, re-upload or re-index every knowledge document because the migration clears old embeddings. Leave Vonage and `PUBLIC_WEBHOOK_BASE_URL` blank until the Supabase, RAG, simulated-call, and tenant-isolation tests pass. Configure the Vonage variables only for the later live-call acceptance test.
 
 ## Database connection choice
 

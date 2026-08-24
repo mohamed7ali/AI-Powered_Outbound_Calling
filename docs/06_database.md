@@ -28,7 +28,7 @@ Do not commit `.env`. `SUPABASE_SERVICE_ROLE_KEY` is a server-only secret and mu
 
 `src/outbound_ai/db/repositories/organizations.py` contains organization and membership operations. `src/outbound_ai/db/repositories/knowledge.py` registers documents, inserts raw/normalized Arabic chunks and embeddings, and calls `match_knowledge_chunks`. Higher layers should use these repositories rather than writing SQL directly.
 
-The RAG embedding model must produce **3072-dimensional vectors** because the initial migration uses `extensions.vector(3072)`, matching `OPENAI_EMBEDDING_DIM=3072`. If the team changes the embedding model or dimension, create a new migration and re-embed all chunks; do not silently change the value in `.env`.
+The active RAG embedding model is the Arabic Sentence Transformer `Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet`, which produces **384-dimensional vectors**. Migration `202608230011_switch_to_arabic_sentence_transformer_384.sql` changes the vector column and RPC signatures to `extensions.vector(384)`, clears old embeddings, and requires complete document re-ingestion. Migration `202608230012_calibrate_hybrid_retrieval_scores.sql` bounds dense, lexical, and hybrid scores to the `0..1` ranking range. These scores are not probabilities. Do not change `RAG_EMBEDDING_DIM` silently; any future model or dimension change requires a new migration and re-indexing.
 
 ## Applying with the Supabase CLI
 

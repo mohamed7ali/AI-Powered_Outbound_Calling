@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,8 +35,10 @@ body { background: #07111f; }
 """
 
 
-def _headers(token: str, organization_id: str = "") -> dict[str, str]:
+def _headers(token: str | None, organization_id: str | None = "") -> dict[str, str]:
     headers: dict[str, str] = {}
+    token = token or ""
+    organization_id = organization_id or ""
     if token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
     if organization_id.strip():
@@ -43,7 +46,7 @@ def _headers(token: str, organization_id: str = "") -> dict[str, str]:
     return headers
 
 
-def _request(method: str, path: str, *, token: str = "", organization_id: str = "", **kwargs: Any) -> Any:
+def _request(method: str, path: str, *, token: str | None = "", organization_id: str | None = "", **kwargs: Any) -> Any:
     headers = {**_headers(token, organization_id), **kwargs.pop("headers", {})}
     response = requests.request(
         method,
@@ -75,12 +78,25 @@ def login(email: str, password: str) -> tuple[Any, ...]:
         _error("إعدادات Supabase غير مكتملة على الخادم.")
     if not email.strip() or not password:
         _error("اكتب البريد الإلكتروني وكلمة المرور أولاً.")
-    response = requests.post(
-        f"{supabase_url}/auth/v1/token?grant_type=password",
-        headers={"apikey": anon_key, "Content-Type": "application/json"},
-        json={"email": email.strip(), "password": password},
-        timeout=30,
-    )
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{supabase_url}/auth/v1/token?grant_type=password",
+                headers={
+                    "apikey": anon_key,
+                    "Content-Type": "application/json",
+                },
+                json={"email": email.strip(), "password": password},
+                timeout=(10, 60),
+            )
+            break
+        except requests.exceptions.RequestException:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+
+    if response is None:
+        _error("تعذر الوصول إلى Supabase حالياً. حاول تسجيل الدخول مرة أخرى بعد لحظات.")
     if response.status_code >= 400:
         _error("تعذر تسجيل الدخول. تأكد من الحساب وكلمة المرور.")
     body = response.json()
@@ -127,6 +143,7 @@ def logout() -> tuple[Any, ...]:
         gr.update(visible=False),  # administration_tab
         gr.update(visible=False),  # platform_admin_controls
         gr.update(choices=["AGENT"], value="AGENT"),  # member_role
+        gr.update(choices=[], value=None),  # admin_target_organization
     )
 
 
@@ -207,7 +224,30 @@ def _format_scheduled_task(row: dict[str, Any]) -> str:
     )
 
 
-def schedule_followup(case_id: str, scheduled_for: str, token: str, organization_id: str) -> tuple[str, str]:
+def direct_call(case_id: str, greeting: str, token: str, organization_id: str) -> str:
+    if not case_id or not case_id.strip():
+        _error("اختر حالة صحيحة من قائمة الحالات أولاً.")
+    try:
+        UUID(case_id.strip())
+    except ValueError:
+        _error("معرّف الحالة غير صالح. اضغط تحديث الحالات ثم اختر حالة من القائمة.")
+    try:
+        body = _request(
+            "POST",
+            "/campaign/calls/direct",
+            token=token,
+            organization_id=organization_id,
+            json={
+                "case_id": case_id.strip(),
+                "greeting": greeting.strip() or "مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت.",
+            },
+        )
+        return json.dumps(body, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        raise gr.Error(str(exc))
+
+
+def schedule_followup(case_id: str, scheduled_for: str, token: str, organization_id: str) -> tuple[str, Any]:
     if not case_id or not case_id.strip():
         _error("اختر حالة صحيحة من قائمة الحالات أولاً.")
     try:
@@ -229,6 +269,35 @@ def schedule_followup(case_id: str, scheduled_for: str, token: str, organization
             json={"case_id": case_id, "scheduled_for": scheduled_for.strip()},
         )
         return _format_scheduled_task(row), str(row.get("id", ""))
+    except Exception as exc:
+        raise gr.Error(str(exc))
+
+
+def load_followups(token: str, organization_id: str) -> tuple[list[list[Any]], Any]:
+    if not token or not token.strip() or not organization_id or not organization_id.strip():
+        return [], gr.update(choices=[], value=None)
+    try:
+        rows = _request("GET", "/campaign/followups", token=token, organization_id=organization_id)
+        table = [
+            [
+                row.get("customer_name"),
+                row.get("subject"),
+                row.get("scheduled_for"),
+                row.get("status"),
+                row.get("attempt_number"),
+                row.get("id"),
+            ]
+            for row in rows
+        ]
+        choices = [
+            (
+                f"{row.get('customer_name', 'عميل')} · {row.get('subject', 'متابعة')} · "
+                f"{row.get('status', '')} · {row.get('id', '')}",
+                str(row["id"]),
+            )
+            for row in rows
+        ]
+        return table, gr.update(choices=choices, value=(choices[0][1] if choices else None))
     except Exception as exc:
         raise gr.Error(str(exc))
 
@@ -279,7 +348,7 @@ def resolve_escalation(escalation_id: str, token: str, organization_id: str) -> 
 
 
 def start_followup(task_id: str, greeting: str, token: str, organization_id: str) -> str:
-    if not task_id.strip():
+    if not task_id or not task_id.strip():
         _error("أدخل معرّف مهمة المتابعة من نتيجة الجدولة.")
     try:
         body = _request(
@@ -330,11 +399,9 @@ def ask_agent(message: str, history: list[dict] | None, token: str, organization
                 title = item.get("document_title") or item.get("title") or "مستند المؤسسة"
                 page = item.get("page_number")
                 page_text = f"، الصفحة {page}" if page else ""
-                similarity = item.get("similarity")
-                score_text = f"، درجة المطابقة {similarity}" if similarity is not None else ""
                 quote = (item.get("quote") or item.get("snippet") or "").strip()
                 source_lines.append(
-                    f"- **[{citation_id}] {title}**{page_text}{score_text}\n  {quote}"
+                    f"- **[{citation_id}] {title}**{page_text}\n  {quote}"
                 )
             answer += "\n\n**المصادر:**\n" + "\n".join(source_lines)
         history = history or []
@@ -388,6 +455,8 @@ def create_organization(name: str, slug: str, token: str) -> str:
 
 
 def load_admin_organizations(token: str) -> Any:
+    if not token or not token.strip():
+        return gr.update(choices=[], value=None)
     try:
         session = _request("GET", "/auth/session", token=token)
         memberships = session.get("memberships", [])
@@ -405,7 +474,13 @@ def list_members(token: str, organization_id: str) -> str:
         raise gr.Error(str(exc))
 
 
-def invite_member(email: str, role: str, token: str, organization_id: str) -> str:
+def invite_member(email: str, role: str, token: str, organization_id: str | None) -> str:
+    if not email or not email.strip():
+        _error("أدخل البريد الإلكتروني أولاً.")
+    if not organization_id or not organization_id.strip():
+        _error("اختر المؤسسة المستهدفة قبل إرسال الدعوة. اضغط تحديث قائمة المؤسسات إذا كانت القائمة فارغة.")
+    if not role or role not in {"AGENT", "ORG_ADMIN"}:
+        _error("اختر دوراً صالحاً للمستخدم.")
     try:
         body = _request(
             "POST", f"/admin/{organization_id}/invite", token=token, organization_id=organization_id,
@@ -468,18 +543,46 @@ def build_ui() -> gr.Blocks:
                     refresh = gr.Button("تحديث الحالات")
                     cases = gr.Dataframe(headers=["العميل", "الموضوع", "الحالة", "آخر تحديث"], interactive=False)
                     case_selector = gr.Dropdown(label="الحالة المطلوب متابعتها", choices=[], interactive=True)
+                    gr.Markdown("### اتصال فوري بدون جدولة")
+                    direct_greeting = gr.Textbox(
+                        label="رسالة الاتصال الفوري",
+                        value="مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت.",
+                    )
+                    direct_call_button = gr.Button("اتصال فوري بالعميل", variant="primary")
+                    direct_call_result = gr.Code(label="نتيجة الاتصال الفوري", language="json")
+                    direct_call_button.click(
+                        direct_call,
+                        [case_selector, direct_greeting, token_state, organization],
+                        direct_call_result,
+                    )
+                    gr.Markdown("### جدولة متابعة لاحقة")
                     scheduled_for = gr.Textbox(
                         label="موعد المتابعة (ISO؛ مثال: 2026-08-20T12:00:00+00:00)",
                         value=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
                     )
                     create_task = gr.Button("جدولة متابعة", variant="primary")
                     task_result = gr.Markdown(label="نتيجة الجدولة")
-                    task_id = gr.Textbox(label="معرّف مهمة المتابعة", interactive=True)
+                    task_table = gr.Dataframe(
+                        headers=["العميل", "الموضوع", "الموعد", "الحالة", "المحاولة", "معرّف المهمة"],
+                        interactive=False,
+                    )
+                    refresh_tasks = gr.Button("عرض مهام المتابعة")
+                    task_id = gr.Dropdown(
+                        label="مهمة المتابعة المراد تشغيلها",
+                        choices=[],
+                        allow_custom_value=True,
+                        interactive=True,
+                    )
                     greeting = gr.Textbox(
                         label="رسالة البداية الاختيارية",
                         value="مرحباً، بنتابع مع حضرتك للتأكد إن المشكلة اتحلت.",
                     )
                     refresh.click(load_cases, [token_state, organization], [cases, case_selector])
+                    refresh_tasks.click(
+                        load_followups,
+                        [token_state, organization],
+                        [task_table, task_id],
+                    )
                     create_task.click(
                         schedule_followup,
                         [case_selector, scheduled_for, token_state, organization],
@@ -554,7 +657,7 @@ def build_ui() -> gr.Blocks:
                     gr.Markdown("رابط دعوة المستخدم يفتح صفحة إعداد كلمة المرور، ثم يمكنه تسجيل الدخول من صفحة المنصة.", elem_classes="small-note")
 
 
-            login_button.click(
+            login_event = login_button.click(
                 login,
                 [email, password],
                 [
@@ -570,6 +673,11 @@ def build_ui() -> gr.Blocks:
                     platform_admin_controls,
                     member_role,
                 ],
+            )
+            login_event.then(
+                load_admin_organizations,
+                [token_state],
+                admin_target_organization,
             )
             logout_button.click(
                 logout,
@@ -587,6 +695,7 @@ def build_ui() -> gr.Blocks:
                     administration_tab,
                     platform_admin_controls,
                     member_role,
+                    admin_target_organization,
                 ],
             )
             organization.input(

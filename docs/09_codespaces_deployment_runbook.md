@@ -56,13 +56,19 @@ Create the local environment file. It is ignored by the archive and must never b
 cp .env.example .env
 ```
 
-For the first offline application test, use the simulated provider and deterministic embeddings:
+For the first application test, use simulated telephony and the local Arabic Sentence Transformer:
 
 ```dotenv
 APP_ENV=dev
 LOG_LEVEL=INFO
 TELEPHONY_PROVIDER=simulated
-RAG_EMBEDDING_PROVIDER=deterministic
+RAG_EMBEDDING_PROVIDER=sentence_transformers
+RAG_EMBEDDING_DIM=384
+SENTENCE_TRANSFORMER_MODEL=Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet
+SENTENCE_TRANSFORMER_DEVICE=cpu
+RAG_MIN_CITATION_SCORE=0.30
+RAG_CITATION_RELATIVE_THRESHOLD=0.55
+RAG_MAX_CITATIONS=3
 API_HOST=0.0.0.0
 API_PORT=8000
 GRADIO_PORT=7860
@@ -158,7 +164,7 @@ Create two organizations and at least one agent in each. Log in with an agent fr
 
 ### Stage D: RAG and document ingestion
 
-Configure either deterministic embeddings for an offline test or OpenAI embeddings for production. Log in through Gradio, select the organization UUID, upload a small Arabic PDF/DOCX/TXT document, and confirm that the document appears in the organization’s document list. Ask an Arabic question that is answered by the uploaded document and confirm that the response includes citations. Upload a document to organization A, then verify that an agent from organization B cannot retrieve it.
+Configure the local Sentence Transformer for the standard test, or an approved OpenAI-compatible provider if `OPENAI_EMBEDDING_DIM` is set to the same `RAG_EMBEDDING_DIM`. After applying migration `202608230011_switch_to_arabic_sentence_transformer_384.sql`, re-upload or re-index every knowledge document because the migration clears old embeddings. Log in through Gradio, select the organization UUID, upload a small Arabic PDF/DOCX/TXT document, and confirm that the document appears in the organization’s document list. Ask an Arabic question that is answered by the uploaded document and confirm that the response includes citations. Upload a document to organization A, then verify that an agent from organization B cannot retrieve it.
 
 ### Stage E: Simulated outbound follow-up
 

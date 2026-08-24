@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID
 
 import jwt
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from outbound_ai.common.arabic import normalize_arabic
-from outbound_ai.config.settings import PROJECT_ROOT, get_settings
+from outbound_ai.config.settings import get_settings
 from outbound_ai.db.connection import get_database
 from outbound_ai.db.repositories.calls import (
     find_call_by_id,
+    mark_case_resolved_from_call,
     next_turn_number,
     record_call_turn,
     record_escalation,
@@ -26,39 +27,50 @@ from outbound_ai.db.repositories.calls import (
     update_call_status,
 )
 from outbound_ai.db.repositories.followups import settle_followup_after_call
+from outbound_ai.telephony.local_voice import (
+    audio_file_path,
+    recording_file_path,
+    synthesize_arabic,
+    transcribe_arabic,
+)
 from outbound_ai.telephony.routing import FollowUpAction, decide_follow_up
+from outbound_ai.telephony.vonage import VonageTelephony
 from outbound_ai.telephony.prompts import (
     GREETING_TEXT,
     HANDOFF_TEXT,
+    PROCESSING_TEXT,
     RESOLVED_TEXT,
     UNRESOLVED_TEXT,
 )
 
 router = APIRouter()
-
-
-def _public_key_path() -> Path:
-    value = get_settings().vonage_public_key_path
-    if not str(value):
-        return PROJECT_ROOT / "public.key"
-    return value if value.is_absolute() else PROJECT_ROOT / value
+logger = logging.getLogger(__name__)
 
 
 def _verify_callback(request: Request, payload: dict) -> None:
+    """Verify a signed Vonage callback using the account API signature secret.
+
+    Vonage uses the application private key/public key pair for authenticating our
+    outbound calls. Signed inbound webhooks use a separate account API signature
+    secret and an HS256 JWT. Confusing these two credentials causes every callback
+    to return 403, leaving calls stuck in INITIATED/PENDING.
+    """
+
     settings = get_settings()
     if not settings.vonage_verify_webhooks:
         return
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         raise HTTPException(status_code=403, detail="Missing Vonage webhook signature")
-    public_key = _public_key_path()
-    if not public_key.is_file():
-        raise HTTPException(status_code=503, detail="VONAGE_PUBLIC_KEY_PATH is not configured")
+    signature_secret = settings.vonage_signature_secret
+    if signature_secret is None or not signature_secret.get_secret_value().strip():
+        raise HTTPException(status_code=503, detail="VONAGE_SIGNATURE_SECRET is not configured")
     try:
         claims = jwt.decode(
             header.removeprefix("Bearer ").strip(),
-            public_key.read_text(encoding="utf-8"),
-            algorithms=["RS256"],
+            signature_secret.get_secret_value(),
+            algorithms=["HS256"],
+            issuer="Vonage",
             options={"verify_aud": False},
         )
     except jwt.PyJWTError as exc:
@@ -110,25 +122,170 @@ def _input_text(payload: dict) -> tuple[str, str]:
     return digits, speech
 
 
+def _vonage_talk_action(text: str) -> dict:
+    """Return a provider-managed Arabic TTS action with no local media dependency."""
+    return {"action": "talk", "text": text, "language": "ar"}
+
+
+def _talk_action(text: str) -> dict:
+    """Return local streamed audio when enabled, otherwise Vonage TTS."""
+    settings = get_settings()
+    if settings.local_tts_enabled:
+        audio_path = synthesize_arabic(text)
+        base = (settings.local_voice_public_base_url or settings.public_webhook_base_url).rstrip("/")
+        if not base.startswith("https://"):
+            raise HTTPException(
+                status_code=503,
+                detail="LOCAL_VOICE_PUBLIC_BASE_URL or PUBLIC_WEBHOOK_BASE_URL must be HTTPS when local TTS is enabled",
+            )
+        return {
+            "action": "stream",
+            "streamUrl": [f"{base}/vonage/audio/{audio_path.name}"],
+        }
+    return {"action": "talk", "text": text, "language": "ar"}
+
+
+def _speech_input_action(call_id: UUID) -> dict:
+    settings = get_settings()
+    return {
+        "action": "input",
+        "eventUrl": [f"{settings.public_webhook_base_url.rstrip('/')}/vonage/input/{call_id}"],
+        "eventMethod": "POST",
+        "type": ["speech"],
+        "speech": {
+            "language": "ar-EG",
+            "endOnSilence": 1,
+            "startTimeout": 10,
+        },
+    }
+
+
 def _input_ncco(call_id: UUID) -> list[dict]:
+    # Use the same native Arabic voice for retries in the non-local-STT path.
+    return [_vonage_talk_action(UNRESOLVED_TEXT), _speech_input_action(call_id)]
+
+
+def _recording_action(call_id: UUID) -> dict:
     settings = get_settings()
     base = settings.public_webhook_base_url.rstrip("/")
-    input_url = f"{base}/vonage/input/{call_id}"
-    return [
-        {
-            "action": "talk",
-            "text": UNRESOLVED_TEXT,
-            "language": "ar-EG",
-        },
-        {
-            "action": "input",
-            "eventUrl": [input_url],
-            "eventMethod": "POST",
-            "type": ["dtmf", "speech"],
-            "dtmf": {"maxDigits": 1, "timeOut": 5},
-            "speech": {"language": "ar-EG", "endOnSilence": 1},
-        },
-    ]
+    return {
+        "action": "record",
+        "format": "wav",
+        "endOnSilence": 5,
+        "timeOut": 30,
+        "beepStart": True,
+        "eventUrl": [f"{base}/vonage/recording/{call_id}"],
+        "eventMethod": "POST",
+    }
+
+
+def _answer_ncco(call_id: UUID) -> list[dict]:
+    settings = get_settings()
+    # Always use provider-managed TTS for the first greeting. The answer
+    # webhook must return a playable action without waiting for local model
+    # inference or depending on a locally generated WAV stream. Local TTS
+    # remains available for later response audio after the customer speaks.
+    greeting_action = _vonage_talk_action(GREETING_TEXT)
+    if settings.local_stt_enabled:
+        # Local Whisper needs the customer's audio recording, not Vonage ASR.
+        return [
+            greeting_action,
+            _recording_action(call_id),
+            {"action": "wait", "duration": 180},
+        ]
+    return [greeting_action, _speech_input_action(call_id)]
+
+
+def _process_local_recording(call_id: UUID, payload: dict) -> None:
+    """Download, transcribe, persist, and continue a local-STT call turn."""
+    settings = get_settings()
+    recording_url = str(payload.get("recording_url") or "").strip()
+    if not recording_url:
+        logger.warning("local_recording_missing_url call_id=%s", call_id)
+        return
+    try:
+        call_database = get_database()
+        with call_database.trusted_transaction() as connection:
+            call = find_call_by_id(connection, call_id=call_id)
+        if call is None or call["provider"] != "vonage":
+            logger.warning("local_recording_call_not_found call_id=%s", call_id)
+            return
+
+        provider = VonageTelephony(settings)
+        audio_path = recording_file_path(str(call_id))
+        audio_path.write_bytes(provider.download_recording(recording_url))
+        transcript = transcribe_arabic(audio_path)
+        digits = ""
+        speech = transcript.strip()
+        raw_text = speech or "[NO_INPUT]"
+        decision = decide_follow_up(digits=digits, speech=speech)
+
+        with call_database.trusted_transaction() as connection:
+            current_call = find_call_by_id(connection, call_id=call_id)
+            if current_call is None:
+                return
+            turn_number = next_turn_number(connection, call_id=call_id)
+            record_gather_turn(
+                connection,
+                organization_id=current_call["organization_id"],
+                call_id=call_id,
+                text_raw=raw_text,
+                text_norm=normalize_arabic(speech) if speech else None,
+                turn_number=turn_number,
+                stt_model=f"faster-whisper:{settings.local_stt_model}",
+                language="ar-EG",
+                audio_path=audio_path.name,
+            )
+            ai_turn_number = turn_number + 1
+            if decision.action == FollowUpAction.RESOLVED:
+                response_text = RESOLVED_TEXT
+                update_call_outcome(connection, call_id=call_id, outcome="ANSWERED_RESOLVED")
+                mark_case_resolved_from_call(
+                    connection, call_id=call_id, resolved_at=datetime.now(UTC)
+                )
+            else:
+                response_text = HANDOFF_TEXT if decision.action == FollowUpAction.HUMAN_TASK else UNRESOLVED_TEXT
+                update_call_outcome(connection, call_id=call_id, outcome="ESCALATED")
+                record_escalation(
+                    connection,
+                    organization_id=current_call["organization_id"],
+                    call_id=call_id,
+                    reason=decision.reason,
+                )
+            record_call_turn(
+                connection,
+                organization_id=current_call["organization_id"],
+                call_id=call_id,
+                speaker="AI",
+                text_raw=response_text,
+                turn_number=ai_turn_number,
+                language="ar-EG",
+            )
+
+        # Keep the same provider-managed voice as the greeting. Local MMS
+        # audio remains available for offline testing, but is not used in the
+        # live call path because it produced the inconsistent male voice.
+        provider.modify_call(
+            str(call["provider_call_id"]),
+            [_vonage_talk_action(response_text)],
+            region_url=str(payload.get("region_url") or "") or None,
+        )
+    except Exception:
+        logger.exception("local_recording_processing_failed call_id=%s", call_id)
+
+
+@router.get("/audio/{filename}")
+def local_audio(filename: str) -> FileResponse:
+    settings = get_settings()
+    if not settings.local_tts_enabled:
+        raise HTTPException(status_code=404, detail="Local TTS is disabled")
+    try:
+        path = audio_file_path(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid audio filename") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(path, media_type="audio/wav", filename=path.name)
 
 
 @router.post("/answer/{call_id}")
@@ -158,19 +315,46 @@ async def answer_webhook(call_id: UUID, request: Request) -> JSONResponse:
             turn_number=0,
             language="ar-EG",
         )
-    return JSONResponse(
-        content=[
-            {"action": "talk", "text": GREETING_TEXT, "language": "ar-EG"},
-            {
-                "action": "input",
-                "eventUrl": [f"{get_settings().public_webhook_base_url.rstrip('/')}/vonage/input/{call_id}"],
-                "eventMethod": "POST",
-                "type": ["dtmf", "speech"],
-                "dtmf": {"maxDigits": 1, "timeOut": 5},
-                "speech": {"language": "ar-EG", "endOnSilence": 1},
-            },
-        ]
-    )
+    return JSONResponse(content=_answer_ncco(call_id))
+
+
+@router.post("/recording/{call_id}")
+async def recording_webhook(
+    call_id: UUID,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> Response:
+    payload = await _read_payload(request)
+    _verify_callback(request, payload)
+    database = get_database()
+    with database.trusted_transaction() as connection:
+        call = find_call_by_id(connection, call_id=call_id)
+        if call is None or call["provider"] != "vonage":
+            raise HTTPException(status_code=404, detail="Call not found")
+        record_provider_event(
+            connection,
+            organization_id=call["organization_id"],
+            call_id=call_id,
+            provider="vonage",
+            provider_event_id=_event_id("recording", payload),
+            event_type="RECORDING",
+            payload=payload,
+        )
+    if get_settings().local_stt_enabled and payload.get("recording_url"):
+        # The recording callback can arrive while the original wait action is
+        # still active. Extend that window before starting CPU-bound Whisper
+        # inference, otherwise the provider can end the call mid-processing.
+        try:
+            provider = VonageTelephony(get_settings())
+            provider.modify_call(
+                str(call["provider_call_id"]),
+                [_vonage_talk_action(PROCESSING_TEXT), {"action": "wait", "duration": 180}],
+                region_url=str(payload.get("region_url") or "") or None,
+            )
+        except Exception:
+            logger.exception("local_recording_keepalive_failed call_id=%s", call_id)
+        background_tasks.add_task(_process_local_recording, call_id, payload)
+    return Response(status_code=204)
 
 
 @router.post("/input/{call_id}")
@@ -209,12 +393,15 @@ async def input_webhook(call_id: UUID, request: Request) -> JSONResponse:
         ai_turn_number = turn_number + 1
         if decision.action == FollowUpAction.RESOLVED:
             update_call_outcome(connection, call_id=call_id, outcome="ANSWERED_RESOLVED")
+            mark_case_resolved_from_call(
+                connection, call_id=call_id, resolved_at=datetime.now(UTC)
+            )
             record_call_turn(
                 connection,
                 organization_id=call["organization_id"], call_id=call_id, speaker="AI",
                 text_raw=RESOLVED_TEXT, turn_number=ai_turn_number, language="ar-EG",
             )
-            return JSONResponse(content=[{"action": "talk", "text": RESOLVED_TEXT, "language": "ar-EG"}])
+            return JSONResponse(content=[{"action": "talk", "text": RESOLVED_TEXT, "language": "ar"}])
         update_call_outcome(connection, call_id=call_id, outcome="ESCALATED")
         record_escalation(
             connection,
@@ -227,7 +414,7 @@ async def input_webhook(call_id: UUID, request: Request) -> JSONResponse:
             text_raw=response_text, turn_number=ai_turn_number, language="ar-EG",
         )
         if decision.action == FollowUpAction.HUMAN_TASK:
-            return JSONResponse(content=[{"action": "talk", "text": HANDOFF_TEXT, "language": "ar-EG"}])
+            return JSONResponse(content=[{"action": "talk", "text": HANDOFF_TEXT, "language": "ar"}])
     return JSONResponse(content=_input_ncco(call_id))
 
 

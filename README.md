@@ -14,7 +14,7 @@ The remaining work is mainly production hardening and advanced AI functionality.
 
 ### Use case 1: Automated outbound follow-up
 
-An authorized agent or scheduler selects a customer case. The platform calls the customer through Vonage or the development simulator, presents an Egyptian-Arabic verification prompt, accepts DTMF or provider speech recognition, normalizes the response, classifies the outcome, writes the call data, and ends the call.
+An authorized agent or scheduler selects a customer case. The platform calls the customer through Vonage or the development simulator, presents a clear Modern Standard Arabic verification prompt, captures speech through local recording and Whisper or provider speech input, normalizes the response, classifies the outcome, writes the call data, and ends the call.
 
 The supported post-call outcomes include resolved, unresolved/escalated, no answer, busy, and failed. Unresolved or ambiguous results create an escalation for a human agent. No live transfer is attempted.
 
@@ -36,13 +36,13 @@ After the automated call, a human agent opens the organization’s escalation qu
 | File storage | Private Supabase Storage bucket | Organization-scoped document objects and ingestion source files |
 | Authentication | Supabase Auth, JWT, JWKS/HS256 support | User login, invitation password setup, membership verification, and platform-admin recognition |
 | LLM | Gemini through an OpenAI-compatible client | Arabic answer generation for the knowledge assistant |
-| Embeddings | Deterministic offline embeddings by default; OpenAI-compatible provider option | Zero-cost development mode and configurable production retrieval mode |
-| Telephony | Vonage Voice API plus simulated provider | Outbound calls, Arabic provider-side TTS/STT, event callbacks, and local development without carrier calls |
+| Embeddings | Arabic Sentence Transformer by default; deterministic and OpenAI-compatible options remain available | Local 384-dimensional Arabic embeddings by default, with configurable alternatives |
+| Telephony | Vonage Voice API plus simulated provider | Outbound calls, native Vonage Arabic voice, optional local Whisper recording/STT, event callbacks, and local development without carrier calls |
 | Scheduling | Separate Python worker | Due-task claiming, retries, exponential backoff, and call dispatch |
 | Deployment | Dockerfile and Docker Compose | API, Gradio UI, and scheduler service definitions |
 | Testing | Pytest, async test support, database contract tests | Current unit, integration-oriented, RLS-contract, RAG, routing, telephony, and UI-contract validation |
 
-The pinned Gradio version is intentional. The project uses direct server-side component visibility updates, and Gradio 5.35.0 is the tested version for this UI. The current repository validation run passes **35 tests**.
+The pinned Gradio version is intentional. The project uses direct server-side component visibility updates, and Gradio 5.35.0 is the tested version for this UI. The current repository validation run passes **76 tests**.
 
 ## Current architecture
 
@@ -97,11 +97,11 @@ Vonage callbacks and scheduler operations are server-originated. They use narrow
 | Tenant isolation | Organization-scoped queries, database RLS, private Storage policies, tenant context, and cross-organization access tests/contracts |
 | Authentication | Supabase JWT verification, active membership resolution, platform-admin detection, invitation flow, and password setup page |
 | Organization administration | Platform-admin organization creation, organization selection for invitations, member listing, agent invitations, and organization-admin restrictions |
-| Arabic UI | RTL Gradio workspace, login-first flow, role-aware tabs, Arabic labels, Egyptian-Arabic call prompts, and Arabic error messages |
+| Arabic UI | RTL Gradio workspace, login-first flow, role-aware tabs, Arabic labels, Modern Standard Arabic call prompts, and Arabic error messages |
 | Direct calls | Immediate call action from a selected case without creating a scheduled follow-up task |
 | Scheduled follow-ups | Task creation, due-task claiming, manual start, retries, exponential backoff, status transitions, and automatic task-ID propagation in the UI |
-| Telephony | Vonage outbound call adapter, simulated development adapter, NCCO answer/input/event callbacks, DTMF/speech input handling, and post-call routing |
-| Call persistence | Internal call ID, provider call ID, status, outcome, duration, raw provider events, and text call turns |
+| Telephony | Vonage outbound call adapter, simulated development adapter, native Arabic `talk`, recording or speech-input callbacks, local Whisper option, DTMF/speech input handling, and post-call routing |
+| Call persistence | Internal call ID, provider call ID, status, outcome, duration, raw provider events, text call turns, optional audio paths, and synchronized support-case status |
 | Post-call routing | `ANSWERED_RESOLVED`, `ESCALATED`, `NO_ANSWER`, `BUSY`, and `FAILED` decisions without live transfer |
 | Escalation workflow | Organization-scoped escalation queue, human resolution action, and escalation reporting support |
 | Knowledge ingestion | PDF, DOCX, TXT, Markdown, CSV, and JSON ingestion; Arabic normalization; chunking; embeddings; private Storage upload; and database persistence |
@@ -114,12 +114,12 @@ Vonage callbacks and scheduler operations are server-originated. They use narrow
 
 ## What is still missing or only partially implemented
 
-The following items are deliberately separated from the completed foundation. They should be planned as engineering work rather than described as already available.
+The following items are deliberately separated from the completed foundation. They should be planned as engineering work rather than described as already available. The current structured verification call is implemented; a fully generative multi-turn voice agent is not.
 
 | Area | Current state | Required completion |
 | --- | --- | --- |
 | Comprehensive audit/log system | Structured privacy-safe logs and database audit-event support exist, but coverage is not yet a complete operational audit platform | Define an event taxonomy, add correlation IDs, record important user/admin/data actions consistently, centralize logs, enforce retention, add dashboards/alerts, and document access to audit history |
-| Interactive LLM voice calls | Current calls use provider-side Vonage `talk` and `input` with a structured verification prompt. The LLM does not yet conduct a multi-turn conversation with the customer | Add a real-time voice loop: speech recognition → turn state → LLM response → Arabic TTS → next input, with latency, interruption, timeout, safety, and callback handling |
+| Interactive LLM voice calls | Current calls use native Vonage Arabic `talk` for spoken responses and either local recording plus faster-whisper or provider speech input for structured verification. The LLM does not yet conduct a multi-turn conversation with the customer | Add a real-time voice loop: speech recognition → turn state → LLM response → Arabic TTS → next input, with latency, interruption, timeout, safety, and callback handling |
 | Voice recording and consent | Text turns and raw provider events are stored; audio recording is not enabled by default | Add explicit consent language, recording configuration, encrypted private storage, retention/deletion policy, playback authorization, and regional compliance review |
 | Agentic workflow | The repository has deterministic service boundaries and a graph package placeholder, but LangGraph, LangChain, and LangSmith are not currently wired into the runtime | Introduce explicit state graphs, tool boundaries, retries, tracing, evaluation datasets, and LangSmith observability without weakening tenant isolation |
 | Multimodal and OCR ingestion | Text-oriented PDF, DOCX, TXT, Markdown, CSV, and JSON ingestion is implemented | Add image upload, scanned-PDF OCR, table/image extraction, multimodal document classification, page-level provenance, and safe handling for complicated file types |
@@ -149,7 +149,7 @@ docker-compose.yml                      API, UI, and scheduler services
 
 ## Local setup
 
-Use Python 3.11 or 3.12. The following setup starts the project with deterministic embeddings and simulated telephony so the test workflow does not place a real carrier call.
+Use Python 3.11 or 3.12. The following setup starts the project with the local Arabic Sentence Transformer and simulated telephony so the test workflow does not place a real carrier call.
 
 ```bash
 python3 -m venv .venv
@@ -165,12 +165,15 @@ For an offline demonstration, use:
 
 ```
 TELEPHONY_PROVIDER=simulated
-RAG_EMBEDDING_PROVIDER=deterministic
+RAG_EMBEDDING_PROVIDER=sentence_transformers
+RAG_EMBEDDING_DIM=384
+SENTENCE_TRANSFORMER_MODEL=Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet
+SENTENCE_TRANSFORMER_DEVICE=cpu
 LLM_PROVIDER=gemini
 GEMINI_MODEL=gemini-3.6-flash
 ```
 
-Gemini answer generation requires a valid `GEMINI_API_KEY`. Production embeddings can use the configured OpenAI-compatible provider, but the embedding dimension must remain consistent with the database vector column and migration contract.
+Gemini answer generation requires a valid `GEMINI_API_KEY`. The default local embedding provider is the Arabic Sentence Transformer `Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet`, which produces 384-dimensional vectors. Apply migration `202608230011_switch_to_arabic_sentence_transformer_384.sql` and re-index existing documents before querying. An OpenAI-compatible provider remains optional, but its configured dimension must equal `RAG_EMBEDDING_DIM`.
 
 ## Supabase setup
 
@@ -208,7 +211,7 @@ https://YOUR-PUBLIC-API-HOST/vonage/answer
 https://YOUR-PUBLIC-API-HOST/vonage/event
 ```
 
-Use one authorized internal test number first. Confirm that resolved calls finish as `ANSWERED_RESOLVED`, unresolved calls create an escalation, no-answer calls retry according to policy, duplicate callbacks are harmless, and no live transfer occurs.
+Use one authorized internal test number first. Confirm that resolved calls finish as `ANSWERED_RESOLVED` and synchronize the linked case to `RESOLVED`, unresolved calls create an escalation, no-answer calls retry according to policy, duplicate callbacks are harmless, and no live transfer occurs.
 
 ## Run the services directly
 

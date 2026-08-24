@@ -89,6 +89,44 @@ class VonageTelephony:
     def build_event_webhook_url(self, call_id: UUID) -> str:
         return urljoin(self.base_url, f"vonage/event/{call_id}")
 
+    def modify_call(
+        self,
+        provider_call_id: str,
+        ncco: list[dict],
+        *,
+        region_url: str | None = None,
+    ) -> None:
+        """Replace the NCCO of an active call with a new NCCO sequence."""
+        base = (region_url or "https://api.nexmo.com").rstrip("/")
+        url = f"{base}/v1/calls/{provider_call_id}"
+        response = httpx.put(
+            url,
+            headers={"Authorization": f"Bearer {self._jwt()}"},
+            json={
+                "action": "transfer",
+                "destination": {"type": "ncco", "ncco": ncco},
+            },
+            timeout=20.0,
+        )
+        if response.is_error:
+            raise RuntimeError(
+                f"Vonage call update failed with HTTP {response.status_code}: {response.text[:500]}"
+            )
+
+    def download_recording(self, recording_url: str) -> bytes:
+        """Download a Vonage recording using the application JWT."""
+        response = httpx.get(
+            recording_url,
+            headers={"Authorization": f"Bearer {self._jwt()}"},
+            timeout=60.0,
+        )
+        if response.is_error:
+            raise RuntimeError(
+                f"Vonage recording download failed with HTTP {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+        return response.content
+
     def create_outbound_call(self, request: OutboundCallRequest) -> OutboundCallResult:
         payload = {
             "to": [{"type": "phone", "number": _phone_number(request.to_phone_e164)}],

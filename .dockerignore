@@ -1,4 +1,7 @@
 .env
+.secrets/
+*.key
+*.pem
 .git
 .gitignore
 .pytest_cache

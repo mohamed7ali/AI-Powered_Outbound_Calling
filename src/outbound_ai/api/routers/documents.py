@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 
 from outbound_ai.api.auth import Principal, require_principal, tenant_context
 from outbound_ai.config.settings import get_settings
-from outbound_ai.rag.embeddings import DeterministicEmbeddings, OpenAIEmbeddings
+from outbound_ai.rag.embeddings import build_embeddings
 from outbound_ai.rag.upload import upload_private_document
 
 router = APIRouter()
@@ -37,11 +37,7 @@ def upload_document(
         path = Path(temp_dir) / filename
         path.write_bytes(content)
         settings = get_settings()
-        embeddings = (
-            DeterministicEmbeddings(settings.openai_embedding_dim)
-            if settings.rag_embedding_provider == "deterministic"
-            else OpenAIEmbeddings(settings)
-        )
+        embeddings = build_embeddings(settings)
         try:
             result = upload_private_document(
                 context=context,

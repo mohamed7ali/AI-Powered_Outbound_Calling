@@ -16,10 +16,11 @@ from outbound_ai.ui import app as ui
 ORG = "775bb9b6-5c04-46ff-bdab-0f39e4962eb3"
 
 
-def _login_outputs(role: str):
+def _login_outputs(role: str, *, is_platform_admin: bool = False):
     response = Mock(status_code=200)
     response.json.return_value = {"access_token": "token"}
     session = {
+        "is_platform_admin": is_platform_admin,
         "memberships": [{"id": ORG, "name": "dell", "slug": "dell", "role": role}],
     }
     with patch.object(ui.requests, "post", return_value=response), patch.object(ui, "_request", return_value=session):
@@ -29,10 +30,21 @@ def _login_outputs(role: str):
 def test_org_admin_login_reveals_operational_management_but_not_platform_controls() -> None:
     outputs = _login_outputs("ORG_ADMIN")
     assert outputs[5] == "الدور الحالي: **ORG_ADMIN**"
-    assert outputs[6]["visible"] is True  # administration panel
-    assert outputs[7]["visible"] is False  # organization creation / platform controls
-    assert outputs[8]["choices"] == ["AGENT"]
-    assert outputs[9]["visible"] is True  # campaign/documents/reports/admin parent
+    assert outputs[6]["visible"] is True  # documents tab
+    assert outputs[7]["visible"] is True  # reports tab
+    assert outputs[8]["visible"] is True  # administration tab
+    assert outputs[9]["visible"] is False  # platform controls
+    assert outputs[10]["choices"] == ["AGENT"]
+
+
+def test_platform_admin_session_flag_reveals_full_management_workspace() -> None:
+    outputs = _login_outputs("AGENT", is_platform_admin=True)
+    assert outputs[5] == "الدور الحالي: **PLATFORM_ADMIN**"
+    assert outputs[6]["visible"] is True
+    assert outputs[7]["visible"] is True
+    assert outputs[8]["visible"] is True
+    assert outputs[9]["visible"] is True
+    assert outputs[10]["choices"] == ["AGENT", "ORG_ADMIN"]
 
 
 def test_agent_login_hides_management_parent() -> None:
@@ -40,7 +52,72 @@ def test_agent_login_hides_management_parent() -> None:
     assert outputs[5] == "الدور الحالي: **AGENT**"
     assert outputs[6]["visible"] is False
     assert outputs[7]["visible"] is False
+    assert outputs[8]["visible"] is False
     assert outputs[9]["visible"] is False
+    assert outputs[10]["choices"] == ["AGENT"]
+
+
+def test_logout_clears_session_and_restores_login_view() -> None:
+    outputs = ui.logout()
+    assert len(outputs) == 13
+    assert outputs[0] == ""  # token
+    assert outputs[2]["visible"] is True  # auth panel
+    assert outputs[3]["visible"] is False  # workspace
+    assert outputs[4]["choices"] == []  # organization selector
+    assert outputs[5] == ""  # role badge
+    assert outputs[6] == []  # chatbot history
+    assert outputs[7]["visible"] is False
+    assert outputs[8]["visible"] is False
+    assert outputs[9]["visible"] is False
+    assert outputs[10]["visible"] is False
+    assert outputs[12]["choices"] == []
+
+
+def test_invite_rejects_missing_organization_before_request() -> None:
+    with pytest.raises(Exception) as exc_info:
+        ui.invite_member("new@example.com", "AGENT", "token", None)
+    assert "اختر المؤسسة" in str(exc_info.value)
+
+
+def test_headers_tolerate_empty_gradio_values() -> None:
+    assert ui._headers(None, None) == {}
+
+
+def test_direct_call_uses_immediate_endpoint_without_scheduling() -> None:
+    response = {"call_id": "call-1", "status": "INITIATED", "follow_up_task_id": None}
+    with patch.object(ui, "_request", return_value=response) as request:
+        result = ui.direct_call(ORG, "رسالة اختبار", "token", ORG)
+    request.assert_called_once_with(
+        "POST",
+        "/campaign/calls/direct",
+        token="token",
+        organization_id=ORG,
+        json={"case_id": ORG, "greeting": "رسالة اختبار"},
+    )
+    assert "follow_up_task_id" in result
+
+
+def test_schedule_output_formats_time_and_returns_task_id() -> None:
+    task_id = "b6b6e282-611b-49ea-855e-2da00c14d657"
+    row = {
+        "id": task_id,
+        "case_id": ORG,
+        "scheduled_for": "2026-08-20T21:36:41.406128Z",
+        "status": "PENDING",
+        "attempt_number": 1,
+    }
+    with patch.object(ui, "_request", return_value=row):
+        result, returned_task_id = ui.schedule_followup(
+            ORG,
+            "2026-08-20T21:36:41.406128Z",
+            "token",
+            ORG,
+        )
+    assert returned_task_id == task_id
+    assert "تمت جدولة المتابعة بنجاح" in result
+    assert "موعد التنفيذ" in result
+    assert "أغسطس" in result
+    assert "2026-08-20T21:36:41" not in result
 
 
 def test_org_admin_cannot_create_an_organization() -> None:

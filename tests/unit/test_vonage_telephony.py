@@ -28,6 +28,51 @@ def test_vonage_input_parser_supports_dtmf_and_speech() -> None:
     assert speech == "لسه المشكلة موجودة"
 
 
+def test_vonage_provider_updates_active_call_with_ncco(monkeypatch, tmp_path) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path = tmp_path / "private.key"
+    key_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    settings = Settings(
+        vonage_application_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        vonage_private_key_path=key_path,
+        vonage_from_number="447700900000",
+        public_webhook_base_url="https://example.test",
+        telephony_provider="vonage",
+    )
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 204
+        text = ""
+        is_error = False
+
+    def fake_put(url, *, headers, json, timeout):
+        captured.update({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("outbound_ai.telephony.vonage.httpx.put", fake_put)
+    provider = VonageTelephony(settings)
+    provider.modify_call(
+        "provider-call-uuid",
+        [{"action": "wait", "duration": 120}],
+    )
+    assert captured["url"] == "https://api.nexmo.com/v1/calls/provider-call-uuid"
+    assert captured["json"] == {
+        "action": "transfer",
+        "destination": {
+            "type": "ncco",
+            "ncco": [{"action": "wait", "duration": 120}],
+        },
+    }
+    assert captured["headers"]["Authorization"].startswith("Bearer ")
+
+
 def test_vonage_provider_creates_nexmo_call(monkeypatch, tmp_path) -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     key_path = tmp_path / "private.key"

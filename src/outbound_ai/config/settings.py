@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.6-flash"
     openai_reasoning_model: str = "gpt-4o"
     openai_embedding_model: str = "text-embedding-3-large"
-    openai_embedding_dim: int = 3072
+    # Must match the active Supabase vector column dimension.
+    openai_embedding_dim: int = 384
 
     # ------------------------------------------------------------------- Database
     supabase_url: str = ""
@@ -52,9 +53,23 @@ class Settings(BaseSettings):
     vonage_application_id: str = ""
     vonage_private_key_path: Path = Path("")
     vonage_public_key_path: Path = Path("")
+    # Vonage signs inbound webhooks with the account API signature secret (HS256).
+    # This is different from the application private/public key pair used for outbound JWTs.
+    vonage_signature_secret: SecretStr | None = None
     vonage_from_number: str = ""
     vonage_verify_webhooks: bool = True
     public_webhook_base_url: str = ""
+
+    # ---------------------------------------------------------- Local voice models
+    # Disabled by default so the existing Vonage-managed Voice flow is unchanged.
+    local_stt_enabled: bool = False
+    local_stt_model: str = "small"
+    local_stt_device: str = "cpu"
+    local_stt_compute_type: str = "int8"
+    local_tts_enabled: bool = False
+    local_tts_model: str = "facebook/mms-tts-ara"
+    local_voice_audio_dir: Path = Path(".cache/voice-audio")
+    local_voice_public_base_url: str = ""
     auth_redirect_url: str = ""
     ui_public_url: str = ""
 
@@ -66,18 +81,26 @@ class Settings(BaseSettings):
     gradio_port: int = 7860
 
     # ----------------------------------------------------------------- RAG tuning
-    rag_embedding_provider: Literal["openai", "deterministic"] = "openai"
+    rag_embedding_provider: Literal["sentence_transformers", "openai", "deterministic"] = "sentence_transformers"
+    rag_embedding_dim: int = 384
+    sentence_transformer_model: str = "Omartificial-Intelligence-Space/Arabic-MiniLM-L12-v2-all-nli-triplet"
+    sentence_transformer_device: str = "cpu"
     rag_top_k_dense: int = 20
     rag_top_k_sparse: int = 20
     rag_rrf_k: int = 60
     rag_top_n_after_rerank: int = 5
+    # Hybrid scores are ranking scores, not probabilities. These thresholds
+    # prevent weak tail chunks from being shown as citations.
+    rag_min_citation_score: float = Field(default=0.30, ge=0.0, le=1.0)
+    rag_citation_relative_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    rag_max_citations: int = Field(default=3, ge=1, le=10)
     rag_min_grounding_score: float = Field(default=0.7, ge=0.0, le=1.0)
     agent_internal_token: SecretStr | None = None
 
     # --------------------------------------------------------------------- Derived
     @property
     def audio_cache_path(self) -> Path:
-        path = self.audio_cache_dir
+        path = self.local_voice_audio_dir
         if not path.is_absolute():
             path = PROJECT_ROOT / path
         return path
