@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Cairo';
+  src: url('https://fonts.gstatic.com/s/cairo/v28/SLXgc1nY6HkvangtZmpQdkhzfH5lkSscQyyS4J0.woff2') format('woff2');
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+:root {
+  --color-ink: #12262B;
+  --color-paper: #ECEEEA;
+  --color-amber: #D98E2E;
+  --color-moss: #4C7A63;
+  --color-brick: #B0503A;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: 'Cairo', system-ui, sans-serif;
+}
