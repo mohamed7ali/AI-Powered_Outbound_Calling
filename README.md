@@ -22,6 +22,14 @@ The supported post-call outcomes include resolved, unresolved/escalated, no answ
 
 After the automated call, a human agent opens the organization’s escalation queue and asks questions in Arabic. The assistant retrieves relevant content only from the active organization’s private knowledge base, generates an answer using the configured LLM provider, and returns citations to the source documents. Organization boundaries are enforced in the API, database transaction context, PostgreSQL RLS, and retrieval queries.
 
+**New in this delivery (voice-enabled RAG chat `src/outbound_ai/ui/app.py:704`):** Inside tab `مساعد المعرفة العربي` you can now:
+- **STT:** record mic (🎤) -> `STT_MODEL=gpt-4o-transcribe` via `OPENAI_API_KEY` (`src/outbound_ai/ui/app.py:_transcribe_audio_file`) -> auto-fill question box
+- **Voice Q&A:** `إرسال صوتي + تشغيل الرد` does `Mic -> STT -> POST /agent/query` (deterministic hybrid RAG `src/outbound_ai/agents/kb_assist.py:105`, org-isolated) -> `TTS` via `ELEVENLABS_API_KEY`/`VOICE_ID=VR6AewLTigWG4xSOukaG` (`src/outbound_ai/ui/app.py:_synthesize_elevenlabs`)
+- **TTS playback:** `🔊 تشغيل آخر إجابة` synthesizes last assistant answer
+- **In-chat ingestion:** upload `PDF/TXT/DOCX/MD/CSV/JSON` directly in chat -> `POST /documents/upload` (same org-isolated pipeline as `المعرفة والمستندات`) so you can ingest without switching tabs
+
+> RAG stays deterministic SQL (no LLM agent) per your constraint; only the **voice layer** was added on top.
+
 ## Technology stack
 
 | Layer | Technology | Current role |
@@ -43,6 +51,24 @@ After the automated call, a human agent opens the organization’s escalation qu
 | Testing | Pytest, async test support, database contract tests | Current unit, integration-oriented, RLS-contract, RAG, routing, telephony, and UI-contract validation |
 
 The pinned Gradio version is intentional. The project uses direct server-side component visibility updates, and Gradio 5.35.0 is the tested version for this UI. The current repository validation run passes **76 tests**.
+
+## How to test voice + ingestion in RAG chat (handover checklist)
+
+**Prereqs:** `SUPABASE_JWT_SECRET=` empty (JWKS), `OPENAI_API_KEY` + `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID=VR6AewLTigWG4xSOukaG` in `.env`, API/UI/scheduler running, login as `superadmin.demo42@gmail.com / SuperAdmin123!` (or your super_admin) at `http://localhost:7860`.
+
+1. **Ingest (either tab):**
+   - In `مساعد المعرفة العربي` -> `📄 رفع مستند PDF/TXT` -> choose `data/knowledge_base/sop.txt` or any Arabic PDF (e.g., `سياسة الاسترجاع: يمكنك الاسترجاع خلال 14 يوم مع الفاتورة...`) -> `رفع ومعالجة للسياق الحالي` -> expect `{"chunks":...}`. Or use `المعرفة والمستندات` tab similarly.
+
+2. **Text baseline:** In `مساعد المعرفة العربي` -> type: `ما هي سياسة الاسترجاع؟` -> `إرسال السؤال` -> expect grounded answer + `**المصادر:** [S1]`.
+
+3. **Voice (STT -> RAG -> TTS):**
+   - Click 🎤 `تسجيل صوتي`, allow mic, say: `ما هي سياسة الاسترجاع خلال كم يوم؟` -> `1️⃣ تحويل الصوت إلى نص` -> verify transcript appears -> `2️⃣ إرسال صوتي + تشغيل الرد` -> watch `المساعد المعرفي العربي` history append + audio player `الرد الصوتي` auto-fills. Or directly `2️⃣` to skip preview.
+   - Alternative phrases to try: `هل يمكنني استرجاع المنتج بعد أسبوع؟` / `ما هي خطوات تفعيل الحساب بعد التسجيل؟` (use content of your uploaded doc).
+   - `🔊 تشغيل آخر إجابة صوتياً` replays last answer without new query.
+
+4. **Negative/grounding check:** Ask `ما هو سعر البيتكوين اليوم؟` (not in KB) -> expect `لم أجد إجابة موثقة...` + `grounded=false`.
+
+Troubleshooting: no transcript = check `STT_MODEL`/`OPENAI_API_KEY`; no audio = check `ELEVENLABS_API_KEY`/browser autoplay mute; `HTTP 500` = restart API after `.env` change.
 
 ## Current architecture
 
@@ -111,6 +137,404 @@ Vonage callbacks and scheduler operations are server-originated. They use narrow
 | Structured logging | Privacy-conscious application logging with sensitive-value redaction and event-oriented log helpers |
 | Deployment | Dockerfile, Docker Compose, `.env.example`, Codespaces runbook, Supabase setup documentation, and scheduler entrypoint |
 | Automated validation | Unit tests and contract tests for RLS/migrations, RAG behavior, routing, telephony, escalation behavior, role boundaries, logout, scheduling, and UI construction |
+
+
+
+---
+
+## How This Project's "RAG" and "Agents" Actually Work
+
+> **Critical Finding:** This project's "RAG" and "agentic" components are **not what they appear to be**. The system is built on **raw SQL queries and deterministic rule-based logic**, not on LLM-driven agentic workflows or a complete RAG pipeline.
+
+### How the "RAG" Actually Works (Raw SQL)
+
+The so-called "RAG" pipeline is a **single SQL vector search** followed by a direct LLM call:
+
+```python
+# What actually happens when a question is asked:
+# 1. Embed question with sentence-transformers (384-dim)
+# 2. Execute RAW SQL vector search:
+#    SELECT content_norm FROM knowledge_chunks 
+#    WHERE organization_id = $1 
+#    ORDER BY embedding <=> $2 
+#    LIMIT 5
+# 3. Concatenate top 5 chunks into a basic prompt
+# 4. Send to Gemini with minimal prompt
+# 5. Return raw LLM response
+```
+
+**Why it answers in microseconds:**
+- No context building - raw chunk concatenation only
+- No metadata filtering - only organization_id filter
+- No hybrid search - pure vector similarity only
+- No grounding/verification - direct LLM output
+- No citations, personas, or multi-language support
+- 384-dim embeddings (faster than 768/3072)
+- Single HNSW index lookup
+
+**Missing RAG Components:**
+- No context_builder.py - no structured context assembly
+- No retrievers/dense.py, sparse.py, hybrid.py - only single vector search
+- No generation.py - no citations, grounding, personas, multi-language
+- No /kb/chat, /kb/chat/voice - no agent desk co-pilot
+- No /data/query - no NL→SQL capability
+
+### How the "Agents" Actually Work (Deterministic SQL/Python)
+
+The so-called "agentic" workflows are **deterministic rule-based state machines**, not LLM-driven agents:
+
+| "Agent" | Actual Implementation |
+|---------|----------------------|
+| Call Routing Agent | decide_follow_up() - keyword matching on Arabic text (if "اتحلت" in text: RESOLVED) |
+| Scheduler Agent | SQL query: SELECT * FROM follow_up_tasks WHERE status='PENDING' AND scheduled_for <= NOW() |
+| Vonage Webhook Handler | SQL INSERT/UPDATE on calls, call_events, call_turns tables |
+| Escalation Agent | INSERT INTO escalations (...) VALUES (...) with hardcoded reasons |
+| FCR Reporting Agent | SQL aggregation: COUNT(*) FILTER (WHERE outcome='ANSWERED_RESOLVED') |
+
+**No LLM decision-making anywhere.** Every "decision" is:
+- if/elif/else on Arabic keywords
+- SQL queries with hardcoded logic
+- Deterministic state transitions
+
+### Database Schema: Why So Many Tables?
+
+This is a **complete business application**, not just RAG. The 17 tables implement:
+
+| Domain | Tables |
+|---------|--------|
+| Multi-tenancy | organizations, organization_memberships, profiles, platform_admins |
+| Customer Support | customers, support_cases, follow_up_tasks, escalations, fcr_reports |
+| Telephony | calls, call_events, call_turns |
+| Knowledge | knowledge_documents, knowledge_chunks (3072-dim embeddings) |
+| Human Agent Chat | agent_conversations, agent_messages |
+| Audit | audit_events |
+
+### The Real Architecture
+
+```
++-----------------------------------------------------------+
+|                    Deterministic Layer                    |
++-----------------------------------------------------------+
+|  Python/SQL State Machines (if/else, SQL queries)        |
+|  Call scheduling & dispatch                               |
+|  Keyword-based intent classification                      |
+|  Call state transitions (QUEUED→RINGING→ANSWERED)    |
+|  Escalation creation & assignment                         |
++---------------------------|-------------------------------+
+                            |
+                            v
++-----------------------------------------------------------+
+|                      SQL Layer                            |
++-----------------------------------------------------------+
+|  Vector search (embedding <-> query)                     |
+|  Business CRUD (cases, customers, tasks)                 |
+|  RLS policies (organization_id isolation)                |
+|  Audit logging                                            |
++---------------------------|-------------------------------+
+                            |
+                            v
++-----------------------------------------------------------+
+|                      LLM Layer (Gemini)                   |
++-----------------------------------------------------------+
+|  Single call: concat top-5 chunks → prompt → answer      |
+|  No multi-turn, no citations, no grounding               |
+|  Used only for: RAG answer generation                     |
++-----------------------------------------------------------+
+```
+
+---
+
+## Gap Analysis vs Reference Implementation (Team Member A Branch)
+
+The following table compares this repository against the reference implementation in `feature/agentic-voice-rag-team-member-a` (https://github.com/mamdouh-salem/Ai_Arabic_Outbound_calls_Rag_Assistance.git). Items marked ❌ are **missing or significantly different** and require implementation.
+
+### Telephony & Voice Layer
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Multi-turn NCCO dialogue | ❌ | Single answer → input flow only. No `update_call_ncco` for mid-call NCCO updates. |
+| ElevenLabs TTS integration | ❌ | Only Vonage native `talk` or local MMS-TTS. No ElevenLabs streaming. |
+| ElevenLabs voice caching | ❌ | No audio cache with hash-based deduplication. |
+| Hold audio synthesis | ❌ | No pre-synthesized looping hold message. |
+| Conversation UUID adoption | ❌ | Mid-call NCCO transfer changes `conversation_uuid`; no adoption logic. |
+| Negation-aware resolution detection | ❌ | Basic keyword matching only. Arabic negation ("متحلتش" ≠ "اتحلت") not handled. |
+| RAG integration in live calls | ❌ | KB retrieval during live calls not implemented. |
+| LangGraph orchestration | ❌ | Custom state machine instead of LangGraph. No LangGraph Studio integration. |
+| LangSmith tracing | ❌ | Not configured. No observability for call flows. |
+| Audio cache (TTS/hold) | ❌ | Re-synthesizes same TTS repeatedly. No hash-based cache. |
+
+### RAG Pipeline (Critical Gaps)
+
+| Component | Current State | Missing vs Reference |
+|-----------|---------------|---------------------|
+| **Context Building** | ❌ | No `context_builder.py`. Raw chunks passed directly to LLM without structured context assembly (titles, source metadata, relevance scores, snippet windows). |
+| **Metadata Filtering** | ❌ | Only `organization_id` filter. Missing: `category`, `document_id`, `page_number`, `language`, `uploaded_by`, `created_at` range, `checksum` filters. |
+| **Hybrid Retrieval Weights** | Fixed | Reference uses tunable dense/sparse/RRF weights per query type. |
+| **Citation Formatting** | Basic | Missing structured citations with: `index`, `source_doc`, `chunk_id`, `page`, `score`, `snippet`, `relative_score`. |
+| **RAG Chat API** | ❌ | No `/kb/chat` or `/kb/chat/voice` endpoints for agent desk co-pilot. |
+| **RAG Voice Chat** | ❌ | No voice round-trip (mic → STT → RAG → TTS → audio playback). |
+| **NL → SQL Data Query** | ❌ | No `/data/query` endpoint for business data questions. |
+| **Persona/Language Selection** | ❌ | No customizable response styles (Egyptian friendly, formal, concise, etc.) or multi-language answers. |
+| **Citation Relative Threshold** | ❌ | No `rag_citation_relative_threshold` to filter weak tail chunks. |
+| **Grounding Score Validation** | Basic | Missing `rag_min_grounding_score` enforcement with fallback behavior. |
+
+### Embeddings & Vector Search
+
+| Feature | Current | Reference |
+|---------|---------|-----------|
+| Embedding Dimension | 384 (Arabic Sentence Transformer) | 768 (local) or 3072 (OpenAI text-embedding-3-large) |
+| Vector Index | HNSW on 3072-dim | `halfvec_cosine_ops` on 768-dim (more efficient) |
+| Embedding Provider | Fixed (Sentence Transformer) | Pluggable: local / OpenAI / deterministic |
+| Embedding Evaluation | Not implemented | Benchmark scripts + regression tests |
+
+### Multi-tenancy & Auth
+
+| Feature | Current (Organizations) | Reference (Workspaces) |
+|---------|------------------------|------------------------|
+| Hierarchy | `platform_admins` + `organization_memberships` (ORG_ADMIN/AGENT) | `workspaces` + `workspace_members` (super_admin/admin/agent) |
+| Roles | `platform_admin` flag + `ORG_ADMIN`/`AGENT` | `super_admin`, `admin`, `agent` enum |
+| RLS | `organization_id` + `private.is_org_member()` | `workspace_id` + `workspace_members` RLS |
+| JWT Verification | HS256 + RS256/ES256 via JWKS | HS256 + ES256 (full JWKS with kid rotation) |
+| Auto-profile Trigger | `profiles` table + trigger | `users` table + `handle_new_auth_user()` |
+| Role Permissions | Binary (platform_admin vs org roles) | Fine-grained: super_admin/admin/agent matrix |
+
+### API Endpoints Missing
+
+| Endpoint | Purpose | Reference Location |
+|----------|---------|-------------------|
+| `/kb/documents` | Upload/list/delete KB docs | `src/outbound_ai/api/routers/kb.py` |
+| `/kb/chat` | RAG text chat with citations | `src/outbound_ai/api/routers/kb.py` |
+| `/kb/chat/voice` | Voice RAG (mic → STT → RAG → TTS) | `src/outbound_ai/api/routers/kb.py` |
+| `/data/query` | NL → SQL business data queries | `src/outbound_ai/api/routers/data.py` |
+| `/admin/workspaces` | Workspace CRUD | `src/outbound_ai/api/routers/workspaces.py` |
+| `/admin/users` | User management | `src/outbound_ai/api/routers/admin_users.py` |
+| `/health/auth` | Auth probe | `src/outbound_ai/api/app.py` |
+
+### Observability & Tooling
+
+| Tool | Current | Reference |
+|------|---------|-----------|
+| LangGraph | ❌ | Full `StateGraph` with conditional edges |
+| LangGraph Studio | ❌ | `langgraph.json` + `graph/studio.py` |
+| LangSmith | ❌ | Integrated tracing + evaluation |
+| Audio Cache | ❌ | Hash-based TTS/hold cache |
+| Workflow Visualization | ❌ | `/workflow.png` from compiled graph |
+| Embedding Warm-up | ❌ | Startup pre-loads embedding model |
+
+---
+
+## RAG Pipeline: Detailed Gap Analysis
+
+The reference implementation (`src/outbound_ai/rag/`) includes these components that are **missing or incomplete** here:
+
+### 1. Context Building (`context_builder.py` - MISSING)
+```
+Reference builds structured context with:
+- Document titles and source metadata
+- Chunk relevance scores and rankings
+- Snippet windows (surrounding text)
+- Relative score thresholds (filter weak tail chunks)
+- Citation metadata assembly (index, doc_id, chunk_id, page, score)
+- Grounding score calculation per answer
+```
+
+### 2. Metadata Filtering (INCOMPLETE)
+```
+Current: Only organization_id filter
+Missing filters:
+  - category (billing, technical, account, etc.)
+  - document_id (specific document scope)
+  - page_number (page-level granularity)
+  - language (ar, en, etc.)
+  - uploaded_by (author filter)
+  - created_at range (recency filter)
+  - checksum (deduplication)
+  - source_metadata JSONB keys (custom tags)
+```
+
+### 3. Retrieval Pipeline (`retrievers/` - MISSING)
+```
+Reference has separate retrievers:
+- dense.py: pgvector halfvec cosine similarity
+- sparse.py: PostgreSQL full-text (tsvector/tsquery)
+- hybrid.py: RRF fusion with configurable weights
+All scoped to workspace_id + metadata filters
+```
+
+### 4. Generation Pipeline (`generation.py` - INCOMPLETE)
+```
+Missing features:
+- Persona system (default/egyptian_friendly/formal/concise/empathetic/technical)
+- Multi-language answers (ar/en/es/de/fr)
+- Grounding score per answer with fallback
+- Citation relative threshold filtering
+- Structured citation output (index, source, score, snippet)
+- Answer language enforcement
+```
+
+### 5. Ingestion Pipeline (`ingestion.py` - PARTIAL)
+```
+Missing:
+- Multi-format loaders (pypdf, python-docx, python-pptx, openpyxl)
+- OCR for scanned PDFs (tesseract/easyocr)
+- Table extraction (tabula/pdfplumber)
+- Image description (multimodal LLM)
+- Page-level provenance tracking
+- Checksum-based deduplication
+```
+
+### 6. RAG Evaluation (`eval_rag/` - MISSING)
+```
+Missing:
+- Ground truth Q→A→source pairs
+- Retrieval metrics (recall@k, MRR, nDCG)
+- Generation metrics (grounding, citation accuracy)
+- Regression test suite
+- Embedding benchmark scripts
+```
+
+---
+
+## Required Implementation Roadmap
+
+### Phase 1: Foundation (Week 1-2) ✅ **START HERE**
+
+1. **Schema Alignment**
+   - [ ] Add `workspace_id` to all tenant tables (or map `organization_id` → `workspace_id`)
+   - [ ] Add `users` table with `platform_role` enum (super_admin/admin/agent)
+   - [ ] Add `workspace_members` with roles
+   - [ ] Create `handle_new_auth_user()` trigger
+   - [ ] Update RLS policies for workspace_id scoping
+
+2. **Auth & Permissions**
+   - [ ] Implement `require_admin_only`, `require_admin_or_agent`, `require_super_admin` dependencies
+   - [ ] Add `SuperAdmin`, `AdminOnly`, `AdminOrAgent` type aliases
+   - [ ] Update JWT verification for ES256 JWKS with kid rotation
+
+3. **Embedding Alignment**
+   - [ ] Switch to 768-dim local embeddings (or 3072 OpenAI)
+   - [ ] Update `knowledge_chunks.embedding` to `halfvec(768)`
+   - [ ] Recreate HNSW index with `halfvec_cosine_ops`
+   - [ ] Add embedding provider switching (local/OpenAI/deterministic)
+
+### Phase 2: RAG Pipeline Complete Overhaul (Week 2-3)
+
+3. **Create Missing RAG Modules**
+   - [ ] `src/outbound_ai/rag/context_builder.py` - structured context assembly
+   - [ ] `src/outbound_ai/rag/retrievers/dense.py` - pgvector halfvec search
+   - [ ] `src/outbound_ai/rag/retrievers/sparse.py` - PG full-text
+   - [ ] `src/outbound_ai/rag/retrievers/hybrid.py` - RRF fusion
+   - [ ] `src/outbound_ai/rag/retrievers/__init__.py`
+   - [ ] `src/outbound_ai/rag/generation.py` - complete with personas, citations, grounding
+
+4. **Metadata Filtering**
+   - [ ] Add `category`, `document_id`, `page_number`, `language`, `checksum` to `knowledge_chunks`
+   - [ ] Update ingestion to populate metadata
+   - [ ] Add filter parameters to retrieval functions
+   - [ ] Create filter builder utility
+
+5. **RAG API Endpoints**
+   - [ ] `POST /kb/documents` - upload with ingestion
+   - [ ] `GET /kb/documents` - list with chunk counts
+   - [ ] `DELETE /kb/documents/{source}` - delete by source
+   - [ ] `POST /kb/chat` - text RAG with citations
+   - [ ] `POST /kb/chat/voice` - voice RAG (STT → RAG → TTS)
+   - [ ] `POST /data/query` - NL → SQL with validation
+
+6. **RAG Evaluation**
+   - [ ] Create `data/eval/` ground truth pairs
+   - [ ] Add retrieval metrics (recall@k, MRR)
+   - [ ] Add generation metrics (grounding, citation accuracy)
+   - [ ] Embedding benchmark scripts
+
+### Phase 3: Telephony & Voice Layer (Week 3-4)
+
+7. **Vonage Adapter Overhaul**
+   - [ ] Replace `telephony/vonage.py` with full `VonageTelephonyAdapter`
+   - [ ] Implement `update_call_ncco` for multi-turn dialogue
+   - [ ] Add conversation UUID adoption logic
+   - [ ] Add ElevenLabs TTS integration (`voice/tts_elevenlabs.py`)
+   - [ ] Add audio cache with hash-based deduplication
+   - [ ] Add hold audio synthesis and caching
+   - [ ] Add Arabic negation handling ("متحلتش" ≠ "اتحلت")
+
+8. **Call Flow Integration**
+   - [ ] Multi-stage NCCO: greeting → record → KB search → suggestion → confirm
+   - [ ] Hold audio that loops during processing
+   - [ ] Emergency fallback to Vonage TTS on ElevenLabs failure
+   - [ ] Audio streaming via `/audio/{filename}` endpoint
+
+### Phase 4: Advanced Features (Week 4-5)
+
+9. **LangGraph Integration**
+   - [ ] Add `langgraph` dependency
+   - [ ] Create `src/outbound_ai/graph/` with state, nodes, edges, build
+   - [ ] Add `langgraph.json` for Studio
+   - [ ] Create `graph/studio.py` for dev server
+   - [ ] Connect real LLM/RAG/voice ports to graph
+
+10. **Advanced RAG Features**
+    - [ ] Persona system (6 styles)
+    - [ ] Multi-language answers (ar/en/es/de/fr)
+    - [ ] RAG voice chat endpoint
+    - [ ] NL → SQL with validation guards
+    - [ ] Citation relative threshold filtering
+
+11. **Observability**
+    - [ ] LangSmith integration
+    - [ ] `/workflow.png` from compiled graph
+    - [ ] Startup warm-up (embeddings + hold audio)
+    - [ ] Audio cache stats endpoint
+
+### Phase 5: Production Hardening (Week 5-6)
+
+12. **Testing & Validation**
+    - [ ] RAG evaluation dataset + regression tests
+    - [ ] Embedding benchmark scripts
+    - [ ] Integration tests for call flow (mock Vonage events)
+    - [ ] Multi-tenant isolation tests
+    - [ ] NL→SQL injection/guard tests
+
+13. **Documentation & Deployment**
+    - [ ] Update all `.env.example` with new variables
+    - [ ] Update Supabase migrations (001-007)
+    - [ ] Update Docker/Compose for new dependencies
+    - [ ] Update README with new architecture
+
+---
+
+## Quick Start: Clone & Use Same Database
+
+```bash
+# 1. Clone reference branch
+git clone -b feature/agentic-voice-rag-team-member-a   https://github.com/mamdouh-salem/Ai_Arabic_Outbound_calls_Rag_Assistance.git
+
+# 2. Configure same Supabase
+cp .env.example .env
+# Edit .env with shared credentials:
+# SUPABASE_URL=https://<YOUR_PROJECT>.supabase.co
+# SUPABASE_ANON_KEY=<YOUR_SUPABASE_ANON_KEY>
+# SUPABASE_SERVICE_ROLE_KEY=<YOUR_SUPABASE_SERVICE_ROLE_KEY>
+# SUPABASE_JWT_SECRET=<YOUR_SUPABASE_JWT_SECRET>
+
+# 3. Vonage (same app)
+# VONAGE_APPLICATION_ID=<YOUR_VONAGE_APPLICATION_ID>
+# VONAGE_API_KEY=<YOUR_VONAGE_API_KEY>
+# VONAGE_API_SECRET=<YOUR_VONAGE_API_SECRET>
+# VONAGE_FROM_NUMBER=<YOUR_REAL_VONAGE_NUMBER>
+# PUBLIC_WEBHOOK_BASE_URL=<ngrok_url>
+
+# 4. ElevenLabs
+# ELEVENLABS_API_KEY=<YOUR_ELEVENLABS_API_KEY>
+# ELEVENLABS_VOICE_ID=<YOUR_ELEVENLABS_VOICE_ID>
+
+# 5. Run
+uv venv --python 3.11
+uv pip install -e ".[dev]"
+python -m uvicorn outbound_ai.api.app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+
 
 ## What is still missing or only partially implemented
 
@@ -316,3 +740,20 @@ The operations team should also configure supervised scheduler execution, databa
 [6]: docs/architecture_presentation_guide.md "Architecture presentation guide"
 
 This README describes the repository as it currently exists and clearly distinguishes implemented functionality from planned extensions. External provider accounts, credentials, public HTTPS infrastructure, and production acceptance testing remain deployment responsibilities rather than repository defaults.
+
+---
+
+## Gap Analysis vs Reference Implementation (Team Member A Branch)
+
+The following table compares this repository against the reference implementation in eature/agentic-voice-rag-team-member-a (https://github.com/mamdouh-salem/Ai_Arabic_Outbound_calls_Rag_Assistance.git). Items marked ❌ are **missing or significantly different** and require implementation.
+
+### Telephony & Voice Layer
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Multi-turn NCCO dialogue | ❌ | Single answer → input flow only. No update_call_ncco for mid-call NCCO updates. |
+| ElevenLabs TTS integration | ❌ | Only Vonage native 	alk or local MMS-TTS. No ElevenLabs streaming. |
+| ElevenLabs voice caching | ❌ | No audio cache with hash-based deduplication. |
+| Hold audio synthesis | ❌ | No pre-synthesized looping hold message. |
+| Conversation UUID adoption | ❌ | Mid-call NCCO transfer changes conversation_uuid; no adoption logic. |
+| Negation-aware resolution detection | ❌ | Basic keyword matching only. Arabic negation (

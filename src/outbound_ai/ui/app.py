@@ -425,6 +425,111 @@ def upload_document(file_path: str, token: str, organization_id: str) -> str:
         raise gr.Error(str(exc))
 
 
+# ---- Voice (STT/TTS) + in-chat ingestion helpers for RAG assistant ----
+def _transcribe_audio_file(audio_path: str) -> str:
+    """Transcribe mic audio via OpenAI STT (gpt-4o-transcribe/whisper-1) or raise."""
+    if not audio_path or not Path(audio_path).exists():
+        _error("سجل صوتاً أولاً.")
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        _error("OPENAI_API_KEY غير مضبوط — فعّل STT في .env")
+    model = os.getenv("STT_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe"
+    lang = os.getenv("STT_LANGUAGE", "ar").strip() or "ar"
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        with open(audio_path, "rb") as f:
+            # gpt-4o-transcribe/whisper-1 both accept file + language
+            kwargs: dict[str, Any] = {"model": model, "file": f}
+            # only whisper supports language param in some SDK versions
+            try:
+                kwargs["language"] = lang
+                resp = client.audio.transcriptions.create(**kwargs)  # type: ignore[arg-type]
+            except TypeError:
+                kwargs.pop("language", None)
+                resp = client.audio.transcriptions.create(**kwargs)  # type: ignore[arg-type]
+        text = getattr(resp, "text", "") or ""
+        if not text.strip():
+            _error("لم يتم التعرف على الكلام. حاول مرة أخرى.")
+        return text.strip()
+    except Exception as exc:
+        raise gr.Error(f"فشل التعرف على الصوت: {exc}")
+
+
+def transcribe_mic(audio_path: str) -> str:
+    """Gradio wrapper: audio filepath -> text for the question box."""
+    return _transcribe_audio_file(audio_path)
+
+
+def _synthesize_elevenlabs(text: str) -> str | None:
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "VR6AewLTigWG4xSOukaG").strip()
+    model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip()
+    if not api_key or not text.strip():
+        return None
+    try:
+        import requests as _rq
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+        payload = {"text": text.strip(), "model_id": model, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
+        r = _rq.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code >= 400:
+            return None
+        out_dir = Path(os.getenv("AUDIO_CACHE_DIR", "audio_cache"))
+        if not out_dir.is_absolute():
+            out_dir = Path(__file__).resolve().parents[3] / out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"chat_tts_{int(time.time()*1000)}.mp3"
+        out_path.write_bytes(r.content)
+        return str(out_path)
+    except Exception:
+        return None
+
+
+def speak_last_answer(history: list[dict] | None) -> str | None:
+    """Take last assistant answer, synthesize via ElevenLabs, return audio path."""
+    if not history:
+        _error("لا توجد إجابة لتشغيلها.")
+    # find last assistant message
+    last = next((m for m in reversed(history) if m.get("role") == "assistant"), None)
+    if not last or not last.get("content"):
+        _error("لا توجد إجابة صوتية.")
+    text = str(last["content"])
+    # strip citation markdown for cleaner TTS
+    # keep first 900 chars to stay within latency
+    if len(text) > 900:
+        text = text[:900]
+    path = _synthesize_elevenlabs(text)
+    if not path:
+        _error("فشل التركيب الصوتي — تأكد من ELEVENLABS_API_KEY والاتصال.")
+    return path
+
+
+def ask_agent_voice(audio_path: str, history: list[dict] | None, token: str, organization_id: str) -> tuple[list[dict], str, str | None]:
+    """Mic -> STT -> RAG query -> (history + TTS audio). Keeps deterministic RAG via /agent/query."""
+    if not audio_path:
+        _error("سجل سؤالاً صوتياً أولاً.")
+    question = _transcribe_audio_file(audio_path)
+    new_history, _ = ask_agent(question, history, token, organization_id)
+    # auto TTS for the new answer (best-effort, don't fail the chat if TTS down)
+    audio_out = None
+    try:
+        audio_out = _synthesize_elevenlabs(new_history[-1]["content"] if new_history else "")
+    except Exception:
+        audio_out = None
+    return new_history, "", audio_out
+
+
+def upload_chat_document(file_path: str, token: str, organization_id: str) -> str:
+    """Upload PDF/TXT directly from the chat tab into org knowledge base."""
+    if not file_path:
+        _error("اختر ملف PDF/TXT أولاً.")
+    # reuse existing endpoint - deterministic ingestion, org-isolated
+    return upload_document(file_path, token, organization_id)
+
+
 def list_documents(token: str, organization_id: str) -> str:
     try:
         body = _request("GET", "/documents", token=token, organization_id=organization_id)
@@ -603,6 +708,27 @@ def build_ui() -> gr.Blocks:
                     send = gr.Button("إرسال السؤال", variant="primary")
                     send.click(ask_agent, [question, chatbot, token_state, organization], [chatbot, question])
                     question.submit(ask_agent, [question, chatbot, token_state, organization], [chatbot, question])
+                    gr.Markdown("#### 🎙️ السؤال الصوتي (STT → RAG → TTS)", elem_classes="small-note")
+                    gr.Markdown("سجل سؤالك بالعربية، سيتحول إلى نص ثم يُرسل للمساعد ويُشغل الرد صوتياً. النموذج: `STT_MODEL` + `ELEVENLABS_VOICE_ID` من .env", elem_classes="small-note")
+                    with gr.Row():
+                        mic = gr.Audio(sources=["microphone"], type="filepath", label="🎤 تسجيل صوتي (اضغط للتسجيل)")
+                        mic_text = gr.Textbox(label="النص المحول (للمراجعة قبل الإرسال)", placeholder="سيظهر النص هنا بعد التحويل...")
+                    with gr.Row():
+                        transcribe_btn = gr.Button("1️⃣ تحويل الصوت إلى نص")
+                        voice_ask_btn = gr.Button("2️⃣ إرسال صوتي + تشغيل الرد", variant="primary")
+                    with gr.Row():
+                        tts_btn = gr.Button("🔊 تشغيل آخر إجابة صوتياً")
+                        tts_audio = gr.Audio(label="الرد الصوتي", type="filepath", autoplay=False, interactive=False)
+                    gr.Markdown("#### 📄 رفع مستند للسياق (PDF/TXT) من داخل المحادثة", elem_classes="small-note")
+                    with gr.Row():
+                        chat_doc = gr.File(label="اختر PDF / TXT / DOCX", file_types=[".pdf", ".txt", ".docx", ".md", ".csv", ".json"], type="filepath")
+                        chat_upload_btn = gr.Button("رفع ومعالجة للسياق الحالي", variant="secondary")
+                    chat_doc_result = gr.Code(label="نتيجة الرفع (ثم اسأل فوق)", language="json")
+                    # wiring
+                    transcribe_btn.click(transcribe_mic, [mic], [mic_text])
+                    voice_ask_btn.click(ask_agent_voice, [mic, chatbot, token_state, organization], [chatbot, mic_text, tts_audio])
+                    tts_btn.click(speak_last_answer, [chatbot], [tts_audio])
+                    chat_upload_btn.click(upload_chat_document, [chat_doc, token_state, organization], [chat_doc_result])
 
                 with gr.Tab("المعرفة والمستندات") as documents_tab:
                     document = gr.File(label="رفع مستند المؤسسة PDF / DOCX / TXT", type="filepath")
