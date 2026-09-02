@@ -119,7 +119,7 @@ def match_chunks(
                d.title as document_title, d.storage_path,
                m.content_raw, m.page_number, m.similarity
         from public.match_knowledge_chunks(
-          %s::extensions.vector(384), %s::uuid, %s::integer
+          %s::extensions.vector(768), %s::uuid, %s::integer
         ) m
         join public.knowledge_documents d on d.id = m.document_id
         """
@@ -151,7 +151,7 @@ def hybrid_match_chunks(
                m.content_raw, m.page_number,
                m.dense_similarity, m.lexical_score, m.similarity
         from public.hybrid_knowledge_chunks(
-          %s::extensions.vector(384), %s, %s::uuid, %s::integer
+          %s::extensions.vector(768), %s, %s::uuid, %s::integer
         ) m
         join public.knowledge_documents d on d.id = m.document_id
         """

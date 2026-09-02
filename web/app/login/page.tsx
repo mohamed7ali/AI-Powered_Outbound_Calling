@@ -1,17 +1,27 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { supabase } from "../supabaseClient";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const router = useRouter();
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setError("Supabase غير مُفعّل بعد — في انتظار بيانات الاتصال.");
-    // Real Supabase call goes here once credentials are ready.
+    setError("");
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setLoading(false);
+    if (error) {
+      setError(error.message);
+    } else {
+      router.push("/dashboard");
+    }
   }
 
   return (
@@ -59,9 +69,9 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={loading}
-            className="mt-2 bg-[var(--color-amber)] text-[var(--color-ink)] font-medium rounded-md py-2 hover:opacity-90 transition"
+            className="mt-2 bg-[var(--color-amber)] text-[var(--color-ink)] font-medium rounded-md py-2 hover:opacity-90 transition disabled:opacity-50"
           >
-            دخول
+            {loading ? "جاري الدخول..." : "دخول"}
           </button>
         </form>
       </div>

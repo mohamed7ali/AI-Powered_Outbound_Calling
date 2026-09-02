@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from outbound_ai.api.routers.admin import router as admin_router
 from outbound_ai.api.routers.agent import router as agent_router
@@ -24,6 +25,13 @@ from outbound_ai.telephony.prompts import (
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Arabic Outbound Calls API", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(vonage_router, prefix="/vonage", tags=["vonage"])
     app.include_router(agent_router, prefix="/agent", tags=["agent"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
